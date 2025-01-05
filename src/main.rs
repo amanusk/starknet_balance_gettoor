@@ -3,19 +3,10 @@ use rayon::prelude::*;
 use reqwest::Error;
 use rusqlite::{params, Connection, Result};
 use serde::Deserialize;
-use starknet::{
-    core::crypto::pedersen_hash,
-    core::types::{BlockId, BlockTag, Felt},
-    core::utils::starknet_keccak,
-    providers::{
-        jsonrpc::{HttpTransport, JsonRpcClient},
-        Provider, Url,
-    },
-};
-use std::time::Duration;
+use starknet::{core::crypto::pedersen_hash, core::types::Felt, core::utils::starknet_keccak};
 
 use std::collections::HashMap;
-use std::{env, process};
+use std::env;
 use tokio;
 
 #[derive(Deserialize)]
@@ -29,12 +20,6 @@ async fn main() -> Result<(), Error> {
     // Load environment variables from .env file
     dotenv::dotenv().ok();
 
-    // Read rpc url
-    let rpc_url = env::var("STARKNET_RPC_URL").expect("STARKNET_RPC_URL not set");
-    println!("RPC URL: {}", rpc_url);
-
-    let provider = JsonRpcClient::new(HttpTransport::new(Url::parse(&rpc_url).unwrap()));
-
     let input_file = env::var("INPUT_FILE").expect("INPUT_FILE not set");
 
     // Read and parse the JSON file
@@ -42,31 +27,10 @@ async fn main() -> Result<(), Error> {
     let addresses: Addresses =
         serde_json::from_str(&file_content).expect("Failed to parse JSON file");
 
-    // Go over all tokens and make sure the are deployed
-    for token_address in addresses.tokens.iter() {
-        let token_class = provider
-            .get_class_hash_at(BlockId::Tag(BlockTag::Latest), token_address)
-            .await;
-        match token_class {
-            Ok(class_hash) => {
-                println!("Token class hash: {:#064x}", class_hash);
-            }
-            Err(e) => {
-                println!(
-                    "Failed to get token class of: {:#064x}, {}",
-                    token_address, e
-                );
-                process::exit(1);
-            }
-        }
-    }
-
     let db_path = env::var("DB_PATH").expect("DB_PATH not set");
 
     // Open a connection to the SQLite database
     let conn = Connection::open(&db_path).expect("Failed to open database");
-
-    // let mut accounts_hash_map: HashMap<Felt, Felt> = HashMap::new();
 
     let balances_selector = starknet_keccak("ERC20_balances".as_bytes());
 
