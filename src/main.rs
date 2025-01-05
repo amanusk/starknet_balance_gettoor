@@ -1,4 +1,5 @@
 use bigdecimal::BigDecimal;
+use rayon::prelude::*;
 use reqwest::Error;
 use rusqlite::{params, Connection, Result};
 use serde::Deserialize;
@@ -65,23 +66,28 @@ async fn main() -> Result<(), Error> {
     // Open a connection to the SQLite database
     let conn = Connection::open(&db_path).expect("Failed to open database");
 
-    let mut accounts_hash_map: HashMap<Felt, Felt> = HashMap::new();
+    // let mut accounts_hash_map: HashMap<Felt, Felt> = HashMap::new();
 
-    let start = std::time::SystemTime::now();
-    // create map of storage addresses from contract, and account
     let balances_selector = starknet_keccak("ERC20_balances".as_bytes());
-    for account in addresses.accounts.iter() {
-        let val = pedersen_hash(&balances_selector, account);
-        // println!("Account: {:#064x}, Hash: {:#064x}", account, val);
-        accounts_hash_map.insert(val, account.clone());
-    }
-    let end = std::time::SystemTime::now();
-    let hash_time = end.duration_since(start).unwrap();
-    println!("Hashing time: {:?}", hash_time.as_secs());
+
+    let hashing_start = std::time::SystemTime::now();
+    let accounts_hash_map: HashMap<Felt, Felt> = addresses
+        .accounts
+        .par_iter()
+        .map(|item| {
+            let val = pedersen_hash(&balances_selector, item);
+            (val, item.clone())
+        })
+        .collect();
+
+    let hashing_end = std::time::SystemTime::now();
+    let hash_time = hashing_end.duration_since(hashing_start).unwrap();
+    println!("Hashing time: {:?}", hash_time.as_millis());
 
     let mut token_map = HashMap::new();
 
     for token in addresses.tokens.iter() {
+        let query_start = std::time::SystemTime::now();
         let parsed_token = format!("{:#064x}", token)[2..].to_string();
         // Prepare the SQL statement
         let mut stmt = conn
@@ -107,6 +113,9 @@ async fn main() -> Result<(), Error> {
                 parsed_token
             ))
             .expect("Failed to prepare SQL statement");
+        let query_end = std::time::SystemTime::now();
+        let query_time = query_end.duration_since(query_start).unwrap();
+        println!("Query time: {:?}", query_time.as_millis());
 
         // Execute the query and collect results
         let rows = stmt
@@ -130,7 +139,14 @@ async fn main() -> Result<(), Error> {
             })
             .expect("Failed to execute query");
 
+        let create_rows_end = std::time::SystemTime::now();
+        let rows_time = create_rows_end.duration_since(query_start).unwrap();
+        println!("Rows time: {:?}", rows_time.as_millis());
+
         println!("#### Token: {:#064x} ######", token);
+
+        let balance_map_start = std::time::SystemTime::now();
+
         let mut balance_map = HashMap::new();
         // Print out each row
         for row_result in rows {
@@ -141,16 +157,23 @@ async fn main() -> Result<(), Error> {
                 Felt::from_hex(&storage_str).expect("Failed to parse storage value");
             if accounts_hash_map.contains_key(&storage_addr_felt) {
                 let account = accounts_hash_map.get(&storage_addr_felt).unwrap();
-                println!("Account: {:#064x}", account);
-                let balance_felt = Felt::from_hex(&storage_val).expect("Failed to parse balance");
-                let balance_dec = BigDecimal::new(balance_felt.to_bigint(), 18);
-                println!(
-                    "Balance :{}",
-                    balance_dec // Felt::from_hex(&storage_val).expect("Failed to parse balance")
-                );
-                balance_map.insert(account.clone(), balance_felt);
+                let balance_felt = Felt::from_hex(&storage_val);
+                match balance_felt {
+                    Ok(val) => {
+                        // let balance_dec = BigDecimal::new(val.to_bigint(), 18);
+                        // println!("Account: {:#064x}, Balance :{}", account, balance_dec);
+                        balance_map.insert(account.clone(), val);
+                    }
+                    _ => {
+                        balance_map.insert(account.clone(), Felt::ZERO);
+                    }
+                }
             }
         }
+        let balance_map_end = std::time::SystemTime::now();
+        let balance_map_time = balance_map_end.duration_since(balance_map_start).unwrap();
+        println!("BalanceMap time: {:?}", balance_map_time.as_millis());
+
         token_map.insert(token.clone(), balance_map);
     }
     // TODO: filter all the addresses with 0 value
