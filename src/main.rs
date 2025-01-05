@@ -155,19 +155,10 @@ async fn main() -> Result<(), Error> {
             // println!("storage_str: {}", storage_addr);
             let storage_addr_felt =
                 Felt::from_hex(&storage_str).expect("Failed to parse storage value");
-            if accounts_hash_map.contains_key(&storage_addr_felt) {
-                let account = accounts_hash_map.get(&storage_addr_felt).unwrap();
-                let balance_felt = Felt::from_hex(&storage_val);
-                match balance_felt {
-                    Ok(val) => {
-                        // let balance_dec = BigDecimal::new(val.to_bigint(), 18);
-                        // println!("Account: {:#064x}, Balance :{}", account, balance_dec);
-                        balance_map.insert(account.clone(), val);
-                    }
-                    _ => {
-                        balance_map.insert(account.clone(), Felt::ZERO);
-                    }
-                }
+
+            if let Some(account) = accounts_hash_map.get(&storage_addr_felt) {
+                let balance_felt = Felt::from_hex(&storage_val).unwrap_or_else(|_| Felt::ZERO);
+                balance_map.insert(account.clone(), balance_felt);
             }
         }
         let balance_map_end = std::time::SystemTime::now();
