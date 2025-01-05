@@ -84,7 +84,7 @@ async fn main() -> Result<(), Error> {
     let hash_time = hashing_end.duration_since(hashing_start).unwrap();
     println!("Hashing time: {:?}", hash_time.as_millis());
 
-    let mut token_map = HashMap::new();
+    let mut token_map: HashMap<Felt, HashMap<Felt, Felt>> = HashMap::new();
 
     for token in addresses.tokens.iter() {
         let query_start = std::time::SystemTime::now();
