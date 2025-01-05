@@ -1,0 +1,12 @@
+target
+.DS_Store
+
+.vscode/*
+
+# Added by cargo
+
+/target
+.env
+
+*.csv
+*.json
