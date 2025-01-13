@@ -1,18 +1,88 @@
-use bigdecimal::BigDecimal;
+use std::collections::HashMap;
+use std::env;
+use std::fs::File;
+use std::io::Write;
+
+use csv::Writer;
+
+// use bigdecimal::BigDecimal;
 use rayon::prelude::*;
 use reqwest::Error;
 use rusqlite::{params, Connection, Result};
 use serde::Deserialize;
 use starknet::{core::crypto::pedersen_hash, core::types::Felt, core::utils::starknet_keccak};
 
-use std::collections::HashMap;
-use std::env;
 use tokio;
 
 #[derive(Deserialize)]
 struct Addresses {
     accounts: Vec<Felt>,
     tokens: Vec<Felt>,
+}
+
+fn store_map_as_csv(
+    token_map: &HashMap<Felt, HashMap<Felt, Felt>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::create("token_map.csv")?;
+    let mut wtr = Writer::from_writer(file);
+
+    // Write header row
+    wtr.write_record(&["Token", "Account", "Balance"])?;
+
+    // Write each (token, account, balance) tuple to the CSV
+    for (token, sub_map) in token_map {
+        for (account, balance) in sub_map {
+            wtr.write_record(&[
+                format!("{:#064x}", token),
+                format!("{:#064x}", account),
+                balance.to_string(),
+            ])?;
+        }
+    }
+
+    wtr.flush()?;
+    Ok(())
+}
+
+fn store_map_as_json(
+    token_map: &HashMap<Felt, HashMap<Felt, Felt>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::create("token_map.json")?;
+    serde_json::to_writer_pretty(file, &token_map)?;
+    Ok(())
+}
+
+fn store_map_in_sqlite(token_map: &HashMap<Felt, HashMap<Felt, Felt>>) -> Result<()> {
+    let conn = Connection::open("token_map.db")?;
+
+    // Create the table if it doesn't exist
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS token_map (
+            token TEXT NOT NULL,
+            account TEXT NOT NULL,
+            balance TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    // Prepare the insertion statement
+    let mut stmt = conn.prepare(
+        "INSERT INTO token_map (token, account, balance)
+         VALUES (?1, ?2, ?3)",
+    )?;
+
+    // Insert each row
+    for (token, sub_map) in token_map {
+        for (account, balance) in sub_map {
+            stmt.execute(params![
+                format!("{:#064x}", token),
+                format!("{:#064x}", account),
+                balance.to_string()
+            ])?;
+        }
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -131,8 +201,9 @@ async fn main() -> Result<(), Error> {
 
         token_map.insert(token.clone(), balance_map);
     }
-    // TODO: filter all the addresses with 0 value
-    // println!("{:#?}", token_map);
+    store_map_as_csv(&token_map).expect("Failed to store map as CSV");
+    store_map_as_json(&token_map).expect("Failed to store map as JSON");
+    store_map_in_sqlite(&token_map).expect("Failed to store map in SQLite");
 
     Ok(())
 }
