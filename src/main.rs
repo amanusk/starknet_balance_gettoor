@@ -30,8 +30,8 @@ fn store_map_as_csv(
     for (token, sub_map) in token_map {
         for (account, balance) in sub_map {
             wtr.write_record(&[
-                format!("{:#064x}", token),
-                format!("{:#064x}", account),
+                format!("{token:#064x}"),
+                format!("{account:#064x}"),
                 balance.to_string(),
             ])?;
         }
@@ -111,7 +111,7 @@ fn get_balance_map(
 
     for token in addresses.tokens.iter() {
         let query_start = std::time::SystemTime::now();
-        let parsed_token = format!("{:#064x}", token)[2..].to_string();
+        let parsed_token = format!("{token:#064x}")[2..].to_string();
         // Prepare the SQL statement
         let mut stmt = conn
             .prepare(&format!(
@@ -128,12 +128,11 @@ fn get_balance_map(
             JOIN contract_addresses
                 ON contract_addresses.id = storage_updates.contract_address_id
         WHERE
-            contract_address = X'{}'
+            contract_address = X'{parsed_token}'
             GROUP BY
             contract_address_id,
             storage_address_id
         "#,
-                parsed_token
             ))
             .map_err(|e| eyre::eyre!("Failed to prepare SQL statement: {}", e))?;
         let query_end = std::time::SystemTime::now();
@@ -166,7 +165,7 @@ fn get_balance_map(
         let rows_time = create_rows_end.duration_since(query_start).unwrap();
         println!("Rows time: {:?}", rows_time.as_millis());
 
-        println!("#### Token: {:#064x} ######", token);
+        println!("#### Token: {token:#064x} ######");
 
         let balance_map_start = std::time::SystemTime::now();
 
@@ -175,7 +174,7 @@ fn get_balance_map(
         for row_result in rows {
             let (_, storage_addr, storage_val, _) =
                 row_result.map_err(|e| eyre::eyre!("Failed to get row: {}", e))?;
-            let storage_str = format!("0x{}", storage_addr);
+            let storage_str = format!("0x{storage_addr}");
             // println!("storage_str: {}", storage_addr);
             let storage_addr_felt = Felt::from_hex(&storage_str)
                 .map_err(|e| eyre::eyre!("Failed to parse storage value: {}", e))?;
