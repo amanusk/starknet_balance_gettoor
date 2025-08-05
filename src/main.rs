@@ -11,8 +11,6 @@ use rusqlite::{params, Connection};
 use serde::Deserialize;
 use starknet::{core::crypto::pedersen_hash, core::types::Felt, core::utils::starknet_keccak};
 
-use tokio;
-
 #[derive(Deserialize)]
 struct Addresses {
     accounts: Vec<Felt>,
@@ -26,7 +24,7 @@ fn store_map_as_csv(
     let mut wtr = Writer::from_writer(file);
 
     // Write header row
-    wtr.write_record(&["Token", "Account", "Balance"])?;
+    wtr.write_record(["Token", "Account", "Balance"])?;
 
     // Write each (token, account, balance) tuple to the CSV
     for (token, sub_map) in token_map {
@@ -101,7 +99,7 @@ fn get_balance_map(
         .par_iter()
         .map(|item| {
             let val = pedersen_hash(&balances_selector, item);
-            (val, item.clone())
+            (val, *item)
         })
         .collect();
 
@@ -183,15 +181,15 @@ fn get_balance_map(
                 .map_err(|e| eyre::eyre!("Failed to parse storage value: {}", e))?;
 
             if let Some(account) = accounts_hash_map.get(&storage_addr_felt) {
-                let balance_felt = Felt::from_hex(&storage_val).unwrap_or_else(|_| Felt::ZERO);
-                balance_map.insert(account.clone(), balance_felt);
+                let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
+                balance_map.insert(*account, balance_felt);
             }
         }
         let balance_map_end = std::time::SystemTime::now();
         let balance_map_time = balance_map_end.duration_since(balance_map_start).unwrap();
         println!("BalanceMap time: {:?}", balance_map_time.as_millis());
 
-        token_map.insert(token.clone(), balance_map);
+        token_map.insert(*token, balance_map);
     }
 
     Ok(token_map)
