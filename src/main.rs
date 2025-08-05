@@ -1,20 +1,28 @@
 use std::collections::HashMap;
-use std::env;
 use std::fs::File;
 
+use clap::Parser;
 use csv::Writer;
 use eyre::Result;
 
 // use bigdecimal::BigDecimal;
-use rayon::prelude::*;
-use rusqlite::{params, Connection};
-use serde::Deserialize;
-use starknet::{core::crypto::pedersen_hash, core::types::Felt, core::utils::starknet_keccak};
+use rusqlite::Connection;
+use starknet::core::types::Felt;
 
-#[derive(Deserialize)]
-struct Addresses {
-    accounts: Vec<Felt>,
-    tokens: Vec<Felt>,
+mod balance;
+use balance::{get_balance_map, Addresses};
+
+#[derive(Parser)]
+#[command(name = "balance_gettor")]
+#[command(about = "A CLI tool to get balance information from StarkNet")]
+struct Args {
+    /// Path to the addresses JSON file
+    #[arg(short, long, env = "INPUT_FILE")]
+    input_file: String,
+
+    /// Path to the database
+    #[arg(short, long, env = "DB_PATH")]
+    db_path: String,
 }
 
 fn store_map_as_csv(
@@ -75,7 +83,7 @@ fn store_map_in_sqlite(token_map: &HashMap<Felt, HashMap<Felt, Felt>>) -> eyre::
     // Insert each row
     for (token, sub_map) in token_map {
         for (account, balance) in sub_map {
-            stmt.execute(params![
+            stmt.execute(rusqlite::params![
                 format!("{:#064x}", token),
                 format!("{:#064x}", account),
                 balance.to_string()
@@ -87,129 +95,23 @@ fn store_map_in_sqlite(token_map: &HashMap<Felt, HashMap<Felt, Felt>>) -> eyre::
     Ok(())
 }
 
-fn get_balance_map(
-    conn: &Connection,
-    addresses: &Addresses,
-) -> Result<HashMap<Felt, HashMap<Felt, Felt>>> {
-    let balances_selector = starknet_keccak("ERC20_balances".as_bytes());
-
-    let hashing_start = std::time::SystemTime::now();
-    let accounts_hash_map: HashMap<Felt, Felt> = addresses
-        .accounts
-        .par_iter()
-        .map(|item| {
-            let val = pedersen_hash(&balances_selector, item);
-            (val, *item)
-        })
-        .collect();
-
-    let hashing_end = std::time::SystemTime::now();
-    let hash_time = hashing_end.duration_since(hashing_start).unwrap();
-    println!("Hashing time: {:?}", hash_time.as_millis());
-
-    let mut token_map: HashMap<Felt, HashMap<Felt, Felt>> = HashMap::new();
-
-    for token in addresses.tokens.iter() {
-        let query_start = std::time::SystemTime::now();
-        let parsed_token = format!("{token:#064x}")[2..].to_string();
-        // Prepare the SQL statement
-        let mut stmt = conn
-            .prepare(&format!(
-                r#"
-        SELECT
-            hex(contract_addresses.contract_address),
-            hex(storage_addresses.storage_address),
-            hex(storage_value),
-            MAX(block_number)
-        FROM
-            storage_updates
-            JOIN storage_addresses
-                ON storage_addresses.id = storage_updates.storage_address_id
-            JOIN contract_addresses
-                ON contract_addresses.id = storage_updates.contract_address_id
-        WHERE
-            contract_address = X'{parsed_token}'
-            GROUP BY
-            contract_address_id,
-            storage_address_id
-        "#,
-            ))
-            .map_err(|e| eyre::eyre!("Failed to prepare SQL statement: {}", e))?;
-        let query_end = std::time::SystemTime::now();
-        let query_time = query_end.duration_since(query_start).unwrap();
-        println!("Query time: {:?}", query_time.as_millis());
-
-        // Execute the query and collect results
-        let rows = stmt
-            .query_map(params![], |row| {
-                // You can adapt the indices and types here:
-                // The columns here are (0) hex(contract_address),
-                //                      (1) hex(storage_address),
-                //                      (2) hex(storage_value),
-                //                      (3) max(block_number)
-                let contract_address_hex: String = row.get(0)?;
-                let storage_address_hex: String = row.get(1)?;
-                let storage_value_hex: String = row.get(2)?;
-                let max_block_number: i64 = row.get(3)?;
-
-                Ok((
-                    contract_address_hex,
-                    storage_address_hex,
-                    storage_value_hex,
-                    max_block_number,
-                ))
-            })
-            .map_err(|e| eyre::eyre!("Failed to execute query: {}", e))?;
-
-        let create_rows_end = std::time::SystemTime::now();
-        let rows_time = create_rows_end.duration_since(query_start).unwrap();
-        println!("Rows time: {:?}", rows_time.as_millis());
-
-        println!("#### Token: {token:#064x} ######");
-
-        let balance_map_start = std::time::SystemTime::now();
-
-        let mut balance_map = HashMap::new();
-        // Print out each row
-        for row_result in rows {
-            let (_, storage_addr, storage_val, _) =
-                row_result.map_err(|e| eyre::eyre!("Failed to get row: {}", e))?;
-            let storage_str = format!("0x{storage_addr}");
-            // println!("storage_str: {}", storage_addr);
-            let storage_addr_felt = Felt::from_hex(&storage_str)
-                .map_err(|e| eyre::eyre!("Failed to parse storage value: {}", e))?;
-
-            if let Some(account) = accounts_hash_map.get(&storage_addr_felt) {
-                let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
-                balance_map.insert(*account, balance_felt);
-            }
-        }
-        let balance_map_end = std::time::SystemTime::now();
-        let balance_map_time = balance_map_end.duration_since(balance_map_start).unwrap();
-        println!("BalanceMap time: {:?}", balance_map_time.as_millis());
-
-        token_map.insert(*token, balance_map);
-    }
-
-    Ok(token_map)
-}
-
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     // Load environment variables from .env file
     dotenv::dotenv().ok();
 
-    let input_file = env::var("INPUT_FILE").expect("INPUT_FILE not set");
+    // Parse command line arguments
+    let args = Args::parse();
 
     // Read and parse the JSON file
-    let file_content = std::fs::read_to_string(input_file).expect("Failed to read JSON file");
-    let addresses: Addresses =
-        serde_json::from_str(&file_content).expect("Failed to parse JSON file");
-
-    let db_path = env::var("DB_PATH").expect("DB_PATH not set");
+    let file_content = std::fs::read_to_string(&args.input_file)
+        .map_err(|e| eyre::eyre!("Failed to read JSON file '{}': {}", args.input_file, e))?;
+    let addresses: Addresses = serde_json::from_str(&file_content)
+        .map_err(|e| eyre::eyre!("Failed to parse JSON file '{}': {}", args.input_file, e))?;
 
     // Open a connection to the SQLite database
-    let conn = Connection::open(&db_path).expect("Failed to open database");
+    let conn = Connection::open(&args.db_path)
+        .map_err(|e| eyre::eyre!("Failed to open database '{}': {}", args.db_path, e))?;
 
     let token_map = get_balance_map(&conn, &addresses)?;
 
@@ -218,188 +120,4 @@ async fn main() -> eyre::Result<()> {
     store_map_in_sqlite(&token_map)?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusqlite::Connection as TestConnection;
-
-    fn create_test_database() -> eyre::Result<TestConnection> {
-        let conn = TestConnection::open_in_memory()?;
-
-        // Create the tables according to the schema used in the query
-        conn.execute(
-            "CREATE TABLE contract_addresses (
-                id INTEGER PRIMARY KEY,
-                contract_address BLOB NOT NULL
-            )",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE TABLE storage_addresses (
-                id INTEGER PRIMARY KEY,
-                storage_address BLOB NOT NULL
-            )",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE TABLE storage_updates (
-                id INTEGER PRIMARY KEY,
-                contract_address_id INTEGER NOT NULL,
-                storage_address_id INTEGER NOT NULL,
-                storage_value BLOB NOT NULL,
-                block_number INTEGER NOT NULL,
-                FOREIGN KEY (contract_address_id) REFERENCES contract_addresses(id),
-                FOREIGN KEY (storage_address_id) REFERENCES storage_addresses(id)
-            )",
-            [],
-        )?;
-
-        Ok(conn)
-    }
-
-    fn insert_test_data(conn: &TestConnection) -> eyre::Result<()> {
-        // Insert contract addresses
-        conn.execute(
-            "INSERT INTO contract_addresses (id, contract_address) VALUES (1, ?)",
-            [vec![
-                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
-                0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
-                0x1d, 0x1e, 0x1f, 0x20,
-            ]],
-        )?;
-
-        // Insert storage addresses (these will be the hashed account addresses)
-        // Account 1: 0x00fb35d68faa85e6a5d2f4ec1bb996928942ab831783b0220d7074cef42a0de1
-        conn.execute(
-            "INSERT INTO storage_addresses (id, storage_address) VALUES (1, ?)",
-            [vec![
-                0x00, 0xfb, 0x35, 0xd6, 0x8f, 0xaa, 0x85, 0xe6, 0xa5, 0xd2, 0xf4, 0xec, 0x1b, 0xb9,
-                0x96, 0x92, 0x89, 0x42, 0xab, 0x83, 0x17, 0x83, 0xb0, 0x22, 0x0d, 0x70, 0x74, 0xce,
-                0xf4, 0x2a, 0x0d, 0xe1,
-            ]],
-        )?;
-
-        // Account 2: 0x0777e9a0c5c09c2862d1697e51dc5d7dd5a3a98f50250be5debb7f49c2109ede
-        conn.execute(
-            "INSERT INTO storage_addresses (id, storage_address) VALUES (2, ?)",
-            [vec![
-                0x07, 0x77, 0xe9, 0xa0, 0xc5, 0xc0, 0x9c, 0x28, 0x62, 0xd1, 0x69, 0x7e, 0x51, 0xdc,
-                0x5d, 0x7d, 0xd5, 0xa3, 0xa9, 0x8f, 0x50, 0x25, 0x0b, 0xe5, 0xde, 0xbb, 0x7f, 0x49,
-                0xc2, 0x10, 0x9e, 0xde,
-            ]],
-        )?;
-
-        // Insert storage updates
-        // Token 1, Account 1, Balance 1000
-        conn.execute(
-            "INSERT INTO storage_updates (contract_address_id, storage_address_id, storage_value, block_number) VALUES (1, 1, ?, 100)",
-            [vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xe8]], // 1000 in little endian
-        )?;
-
-        // Token 1, Account 2, Balance 2000
-        conn.execute(
-            "INSERT INTO storage_updates (contract_address_id, storage_address_id, storage_value, block_number) VALUES (1, 2, ?, 100)",
-            [vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xd0]], // 2000 in little endian
-        )?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_get_balance_map() -> eyre::Result<()> {
-        // Create test database
-        let conn = create_test_database()?;
-        insert_test_data(&conn)?;
-
-        // Create test addresses with only one token to simplify the test
-        let addresses = Addresses {
-            accounts: vec![
-                Felt::from_hex(
-                    "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-                )?,
-                Felt::from_hex(
-                    "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-                )?,
-            ],
-            tokens: vec![Felt::from_hex(
-                "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
-            )?],
-        };
-
-        // Call get_balance_map
-        let result = get_balance_map(&conn, &addresses)?;
-
-        // Verify the results
-        assert_eq!(result.len(), 1, "Should have 1 token");
-
-        // Check token 1 balances
-        let token1 =
-            Felt::from_hex("0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20")?;
-        let token1_balances = result.get(&token1).expect("Token 1 should exist");
-        assert_eq!(token1_balances.len(), 2, "Token 1 should have 2 accounts");
-
-        let account1 =
-            Felt::from_hex("0x0234567890abcdcd1234567890abcdef1234567890abcdef1234567890abcded")?;
-        let account2 =
-            Felt::from_hex("0x03cdef123456772babcdef1234567890abcdef1234567890abcdef123456787b")?;
-
-        let balance1 = token1_balances
-            .get(&account1)
-            .expect("Account 1 should exist in token 1");
-        let balance2 = token1_balances
-            .get(&account2)
-            .expect("Account 2 should exist in token 1");
-
-        assert_eq!(
-            balance1.to_string(),
-            "1000",
-            "Account 1 should have balance 1000"
-        );
-        assert_eq!(
-            balance2.to_string(),
-            "2000",
-            "Account 2 should have balance 2000"
-        );
-
-        println!("Test passed successfully!");
-        Ok(())
-    }
-
-    #[test]
-    fn test_get_balance_map_empty_result() -> eyre::Result<()> {
-        // Create test database
-        let conn = create_test_database()?;
-        insert_test_data(&conn)?;
-
-        // Create test addresses with non-existent token
-        let addresses = Addresses {
-            accounts: vec![Felt::from_hex(
-                "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-            )?],
-            tokens: vec![Felt::from_hex(
-                "0x9999999999999999999999999999999999999999999999999999999999999999",
-            )?],
-        };
-
-        // Call get_balance_map
-        let result = get_balance_map(&conn, &addresses)?;
-
-        // Verify the results - should be empty for non-existent token
-        assert_eq!(result.len(), 1, "Should have 1 token entry");
-        let token =
-            Felt::from_hex("0x9999999999999999999999999999999999999999999999999999999999999999")?;
-        let balances = result.get(&token).expect("Token should exist");
-        assert_eq!(
-            balances.len(),
-            0,
-            "Should have no balances for non-existent token"
-        );
-
-        println!("Empty result test passed successfully!");
-        Ok(())
-    }
 }
