@@ -1,16 +1,12 @@
-use std::collections::HashMap;
-use std::fs::File;
-
 use clap::Parser;
-use csv::Writer;
-use eyre::Result;
 
-// use bigdecimal::BigDecimal;
 use rusqlite::Connection;
-use starknet::core::types::Felt;
 
 mod balance;
 use balance::{get_balance_map, Addresses};
+
+mod output;
+use output::{write_results, OutputConfig};
 
 #[derive(Parser)]
 #[command(name = "balance_gettor")]
@@ -23,76 +19,18 @@ struct Args {
     /// Path to the database
     #[arg(short, long, env = "DB_PATH")]
     db_path: String,
-}
 
-fn store_map_as_csv(
-    token_map: &HashMap<Felt, HashMap<Felt, Felt>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::create("token_map.csv")?;
-    let mut wtr = Writer::from_writer(file);
+    /// Output results as CSV
+    #[arg(long)]
+    csv: bool,
 
-    // Write header row
-    wtr.write_record(["Token", "Account", "Balance"])?;
+    /// Output results as JSON
+    #[arg(long)]
+    json: bool,
 
-    // Write each (token, account, balance) tuple to the CSV
-    for (token, sub_map) in token_map {
-        for (account, balance) in sub_map {
-            wtr.write_record(&[
-                format!("{token:#064x}"),
-                format!("{account:#064x}"),
-                balance.to_string(),
-            ])?;
-        }
-    }
-
-    wtr.flush()?;
-    Ok(())
-}
-
-fn store_map_as_json(
-    token_map: &HashMap<Felt, HashMap<Felt, Felt>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::create("token_map.json")?;
-    serde_json::to_writer_pretty(file, &token_map)?;
-    Ok(())
-}
-
-fn store_map_in_sqlite(token_map: &HashMap<Felt, HashMap<Felt, Felt>>) -> eyre::Result<()> {
-    let conn = Connection::open("token_map.db")
-        .map_err(|e| eyre::eyre!("Failed to open SQLite database: {}", e))?;
-
-    // Create the table if it doesn't exist
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS token_map (
-            token TEXT NOT NULL,
-            account TEXT NOT NULL,
-            balance TEXT NOT NULL
-        )",
-        [],
-    )
-    .map_err(|e| eyre::eyre!("Failed to create table: {}", e))?;
-
-    // Prepare the insertion statement
-    let mut stmt = conn
-        .prepare(
-            "INSERT INTO token_map (token, account, balance)
-             VALUES (?1, ?2, ?3)",
-        )
-        .map_err(|e| eyre::eyre!("Failed to prepare insert statement: {}", e))?;
-
-    // Insert each row
-    for (token, sub_map) in token_map {
-        for (account, balance) in sub_map {
-            stmt.execute(rusqlite::params![
-                format!("{:#064x}", token),
-                format!("{:#064x}", account),
-                balance.to_string()
-            ])
-            .map_err(|e| eyre::eyre!("Failed to insert row: {}", e))?;
-        }
-    }
-
-    Ok(())
+    /// Output results to SQLite database
+    #[arg(long)]
+    sqlite: bool,
 }
 
 #[tokio::main]
@@ -102,6 +40,13 @@ async fn main() -> eyre::Result<()> {
 
     // Parse command line arguments
     let args = Args::parse();
+
+    // Create output configuration from CLI arguments
+    let output_config = OutputConfig {
+        csv: args.csv,
+        json: args.json,
+        sqlite: args.sqlite,
+    };
 
     // Read and parse the JSON file
     let file_content = std::fs::read_to_string(&args.input_file)
@@ -115,9 +60,8 @@ async fn main() -> eyre::Result<()> {
 
     let token_map = get_balance_map(&conn, &addresses)?;
 
-    store_map_as_csv(&token_map).map_err(|e| eyre::eyre!("Failed to store map as CSV: {}", e))?;
-    store_map_as_json(&token_map).map_err(|e| eyre::eyre!("Failed to store map as JSON: {}", e))?;
-    store_map_in_sqlite(&token_map)?;
+    // Write results using the new output module
+    write_results(&token_map, &output_config)?;
 
     Ok(())
 }
