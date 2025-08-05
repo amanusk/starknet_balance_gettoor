@@ -34,14 +34,16 @@ pub fn get_balance_map(
 
     // Optimize: Single batched query for all tokens instead of sequential queries
     let batch_query_start = std::time::SystemTime::now();
-    
+
     // Create placeholders for all tokens in the IN clause
-    let token_placeholders = addresses.tokens.iter()
+    let token_placeholders = addresses
+        .tokens
+        .iter()
         .enumerate()
         .map(|(i, _)| format!("?{}", i + 1))
         .collect::<Vec<_>>()
         .join(", ");
-    
+
     let batch_query = format!(
         r#"
         SELECT
@@ -69,7 +71,9 @@ pub fn get_balance_map(
         .map_err(|e| eyre::eyre!("Failed to prepare batched SQL statement: {}", e))?;
 
     // Convert tokens to hex bytes for the query parameters
-    let token_params: Vec<Vec<u8>> = addresses.tokens.iter()
+    let token_params: Vec<Vec<u8>> = addresses
+        .tokens
+        .iter()
         .map(|token| {
             let token_hex = format!("{token:#064x}")[2..].to_string();
             hex::decode(&token_hex).unwrap_or_default()
@@ -77,13 +81,17 @@ pub fn get_balance_map(
         .collect();
 
     // Create parameter references for the query
-    let param_refs: Vec<&dyn rusqlite::ToSql> = token_params.iter()
+    let param_refs: Vec<&dyn rusqlite::ToSql> = token_params
+        .iter()
         .map(|p| p as &dyn rusqlite::ToSql)
         .collect();
 
     let batch_query_end = std::time::SystemTime::now();
     let batch_query_time = batch_query_end.duration_since(batch_query_start).unwrap();
-    println!("Batch query preparation time: {:?}", batch_query_time.as_millis());
+    println!(
+        "Batch query preparation time: {:?}",
+        batch_query_time.as_millis()
+    );
 
     // Execute the batched query
     let execution_start = std::time::SystemTime::now();
@@ -105,13 +113,18 @@ pub fn get_balance_map(
 
     let execution_end = std::time::SystemTime::now();
     let execution_time = execution_end.duration_since(execution_start).unwrap();
-    println!("Batch query execution time: {:?}", execution_time.as_millis());
+    println!(
+        "Batch query execution time: {:?}",
+        execution_time.as_millis()
+    );
 
     // Process results and group by token
     let processing_start = std::time::SystemTime::now();
-    
+
     // Create a map from hex contract address to token Felt
-    let contract_to_token: HashMap<String, Felt> = addresses.tokens.iter()
+    let contract_to_token: HashMap<String, Felt> = addresses
+        .tokens
+        .iter()
         .map(|token| {
             let token_hex = format!("{token:#064x}")[2..].to_string();
             (token_hex.to_uppercase(), *token)
@@ -126,45 +139,53 @@ pub fn get_balance_map(
 
     // Process all rows in parallel and group by token
     let parallel_processing_start = std::time::SystemTime::now();
-    
+
     let grouped_results: HashMap<Felt, Vec<(Felt, Felt)>> = all_rows
         .par_iter()
         .filter_map(|(contract_address_hex, storage_addr, storage_val, _)| {
             // Find which token this row belongs to
             let token = contract_to_token.get(&contract_address_hex.to_uppercase())?;
-            
+
             let storage_str = format!("0x{storage_addr}");
             let storage_addr_felt = Felt::from_hex(&storage_str).ok()?;
             let account = accounts_hash_map.get(&storage_addr_felt)?;
             let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
-            
+
             Some((*token, (*account, balance_felt)))
         })
         .fold(
             HashMap::new,
             |mut acc: HashMap<Felt, Vec<(Felt, Felt)>>, (token, account_balance)| {
-                acc.entry(token).or_insert_with(Vec::new).push(account_balance);
+                acc.entry(token)
+                    .or_insert_with(Vec::new)
+                    .push(account_balance);
                 acc
-            }
+            },
         )
-        .reduce(
-            HashMap::new,
-            |mut acc, local_map| {
-                for (token, mut balances) in local_map {
-                    acc.entry(token).or_insert_with(Vec::new).append(&mut balances);
-                }
-                acc
+        .reduce(HashMap::new, |mut acc, local_map| {
+            for (token, mut balances) in local_map {
+                acc.entry(token)
+                    .or_insert_with(Vec::new)
+                    .append(&mut balances);
             }
-        );
+            acc
+        });
 
     let parallel_processing_end = std::time::SystemTime::now();
-    let parallel_processing_time = parallel_processing_end.duration_since(parallel_processing_start).unwrap();
-    println!("Parallel processing time: {:?}", parallel_processing_time.as_millis());
+    let parallel_processing_time = parallel_processing_end
+        .duration_since(parallel_processing_start)
+        .unwrap();
+    println!(
+        "Parallel processing time: {:?}",
+        parallel_processing_time.as_millis()
+    );
 
     // Convert grouped results to final HashMap structure
     let conversion_start = std::time::SystemTime::now();
-    
-    let mut token_map: HashMap<Felt, HashMap<Felt, Felt>> = addresses.tokens.iter()
+
+    let mut token_map: HashMap<Felt, HashMap<Felt, Felt>> = addresses
+        .tokens
+        .iter()
         .map(|token| (*token, HashMap::new()))
         .collect();
 
@@ -182,12 +203,18 @@ pub fn get_balance_map(
 
     let processing_end = std::time::SystemTime::now();
     let processing_time = processing_end.duration_since(processing_start).unwrap();
-    println!("Total result processing time: {:?}", processing_time.as_millis());
+    println!(
+        "Total result processing time: {:?}",
+        processing_time.as_millis()
+    );
 
     // Print summary for each token
     for token in &addresses.tokens {
         let balance_count = token_map.get(token).map(|m| m.len()).unwrap_or(0);
-        println!("#### Token: {token:#064x} - {} balances ######", balance_count);
+        println!(
+            "#### Token: {token:#064x} - {} balances ######",
+            balance_count
+        );
     }
 
     Ok(token_map)
