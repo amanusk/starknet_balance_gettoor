@@ -15,5 +15,6 @@ bigdecimal = "0.4.1"
 rusqlite = "0.30"
 rayon = "1.7"
 csv = "1.1"
+eyre = "0.6"
 
 
