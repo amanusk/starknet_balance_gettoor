@@ -62,9 +62,10 @@ pub fn get_balance_map(
             .map_err(|e| eyre::eyre!("Failed to prepare SQL statement: {}", e))?;
         let query_end = std::time::SystemTime::now();
         let query_time = query_end.duration_since(query_start).unwrap();
-        println!("Query time: {:?}", query_time.as_millis());
+        println!("Query time for token {token:#064x}: {:?}", query_time.as_millis());
 
         // Execute the query and collect results
+        let data_fetch_start = std::time::SystemTime::now();
         let rows = stmt
             .query_map(params![], |row| {
                 // You can adapt the indices and types here:
@@ -86,32 +87,41 @@ pub fn get_balance_map(
             })
             .map_err(|e| eyre::eyre!("Failed to execute query: {}", e))?;
 
-        let create_rows_end = std::time::SystemTime::now();
-        let rows_time = create_rows_end.duration_since(query_start).unwrap();
-        println!("Rows time: {:?}", rows_time.as_millis());
+        // Collect all rows into a vector for parallel processing
+        let row_data: Vec<(String, String, String, i64)> = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| eyre::eyre!("Failed to collect rows: {}", e))?;
+        
+        let data_fetch_end = std::time::SystemTime::now();
+        let fetch_time = data_fetch_end.duration_since(data_fetch_start).unwrap();
+        println!("Data fetch time for token {token:#064x}: {:?}", fetch_time.as_millis());
 
         println!("#### Token: {token:#064x} ######");
 
         let balance_map_start = std::time::SystemTime::now();
 
-        let mut balance_map = HashMap::new();
-        // Print out each row
-        for row_result in rows {
-            let (_, storage_addr, storage_val, _) =
-                row_result.map_err(|e| eyre::eyre!("Failed to get row: {}", e))?;
-            let storage_str = format!("0x{storage_addr}");
-            // println!("storage_str: {}", storage_addr);
-            let storage_addr_felt = Felt::from_hex(&storage_str)
-                .map_err(|e| eyre::eyre!("Failed to parse storage value: {}", e))?;
+        // Process balance calculations in parallel using rayon
+        let balance_entries: Vec<(Felt, Felt)> = row_data
+            .par_iter()
+            .filter_map(|(_, storage_addr, storage_val, _)| {
+                let storage_str = format!("0x{storage_addr}");
+                
+                if let Ok(storage_addr_felt) = Felt::from_hex(&storage_str) {
+                    if let Some(account) = accounts_hash_map.get(&storage_addr_felt) {
+                        let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
+                        return Some((*account, balance_felt));
+                    }
+                }
+                None
+            })
+            .collect();
 
-            if let Some(account) = accounts_hash_map.get(&storage_addr_felt) {
-                let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
-                balance_map.insert(*account, balance_felt);
-            }
-        }
+        // Convert parallel results to HashMap
+        let balance_map: HashMap<Felt, Felt> = balance_entries.into_iter().collect();
+
         let balance_map_end = std::time::SystemTime::now();
         let balance_map_time = balance_map_end.duration_since(balance_map_start).unwrap();
-        println!("BalanceMap time: {:?}", balance_map_time.as_millis());
+        println!("BalanceMap time for token {token:#064x}: {:?}", balance_map_time.as_millis());
 
         token_map.insert(*token, balance_map);
     }
