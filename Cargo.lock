@@ -175,6 +175,7 @@ dependencies = [
  "csv",
  "dotenv",
  "eyre",
+ "hex",
  "num-bigint",
  "rayon",
  "reqwest",
