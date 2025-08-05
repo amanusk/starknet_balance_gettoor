@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::io::Write;
 
 use csv::Writer;
+use eyre::Result;
 
 // use bigdecimal::BigDecimal;
 use rayon::prelude::*;
-use reqwest::Error;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection};
 use serde::Deserialize;
 use starknet::{core::crypto::pedersen_hash, core::types::Felt, core::utils::starknet_keccak};
 
@@ -52,8 +51,9 @@ fn store_map_as_json(
     Ok(())
 }
 
-fn store_map_in_sqlite(token_map: &HashMap<Felt, HashMap<Felt, Felt>>) -> Result<()> {
-    let conn = Connection::open("token_map.db")?;
+fn store_map_in_sqlite(token_map: &HashMap<Felt, HashMap<Felt, Felt>>) -> eyre::Result<()> {
+    let conn = Connection::open("token_map.db")
+        .map_err(|e| eyre::eyre!("Failed to open SQLite database: {}", e))?;
 
     // Create the table if it doesn't exist
     conn.execute(
@@ -63,13 +63,16 @@ fn store_map_in_sqlite(token_map: &HashMap<Felt, HashMap<Felt, Felt>>) -> Result
             balance TEXT NOT NULL
         )",
         [],
-    )?;
+    )
+    .map_err(|e| eyre::eyre!("Failed to create table: {}", e))?;
 
     // Prepare the insertion statement
-    let mut stmt = conn.prepare(
-        "INSERT INTO token_map (token, account, balance)
-         VALUES (?1, ?2, ?3)",
-    )?;
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO token_map (token, account, balance)
+             VALUES (?1, ?2, ?3)",
+        )
+        .map_err(|e| eyre::eyre!("Failed to prepare insert statement: {}", e))?;
 
     // Insert each row
     for (token, sub_map) in token_map {
@@ -78,30 +81,18 @@ fn store_map_in_sqlite(token_map: &HashMap<Felt, HashMap<Felt, Felt>>) -> Result
                 format!("{:#064x}", token),
                 format!("{:#064x}", account),
                 balance.to_string()
-            ])?;
+            ])
+            .map_err(|e| eyre::eyre!("Failed to insert row: {}", e))?;
         }
     }
 
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
-    // Load environment variables from .env file
-    dotenv::dotenv().ok();
-
-    let input_file = env::var("INPUT_FILE").expect("INPUT_FILE not set");
-
-    // Read and parse the JSON file
-    let file_content = std::fs::read_to_string(input_file).expect("Failed to read JSON file");
-    let addresses: Addresses =
-        serde_json::from_str(&file_content).expect("Failed to parse JSON file");
-
-    let db_path = env::var("DB_PATH").expect("DB_PATH not set");
-
-    // Open a connection to the SQLite database
-    let conn = Connection::open(&db_path).expect("Failed to open database");
-
+fn get_balance_map(
+    conn: &Connection,
+    addresses: &Addresses,
+) -> Result<HashMap<Felt, HashMap<Felt, Felt>>> {
     let balances_selector = starknet_keccak("ERC20_balances".as_bytes());
 
     let hashing_start = std::time::SystemTime::now();
@@ -146,7 +137,7 @@ async fn main() -> Result<(), Error> {
         "#,
                 parsed_token
             ))
-            .expect("Failed to prepare SQL statement");
+            .map_err(|e| eyre::eyre!("Failed to prepare SQL statement: {}", e))?;
         let query_end = std::time::SystemTime::now();
         let query_time = query_end.duration_since(query_start).unwrap();
         println!("Query time: {:?}", query_time.as_millis());
@@ -171,7 +162,7 @@ async fn main() -> Result<(), Error> {
                     max_block_number,
                 ))
             })
-            .expect("Failed to execute query");
+            .map_err(|e| eyre::eyre!("Failed to execute query: {}", e))?;
 
         let create_rows_end = std::time::SystemTime::now();
         let rows_time = create_rows_end.duration_since(query_start).unwrap();
@@ -184,11 +175,12 @@ async fn main() -> Result<(), Error> {
         let mut balance_map = HashMap::new();
         // Print out each row
         for row_result in rows {
-            let (_, storage_addr, storage_val, _) = row_result.expect("Failed to get row");
+            let (_, storage_addr, storage_val, _) =
+                row_result.map_err(|e| eyre::eyre!("Failed to get row: {}", e))?;
             let storage_str = format!("0x{}", storage_addr);
             // println!("storage_str: {}", storage_addr);
-            let storage_addr_felt =
-                Felt::from_hex(&storage_str).expect("Failed to parse storage value");
+            let storage_addr_felt = Felt::from_hex(&storage_str)
+                .map_err(|e| eyre::eyre!("Failed to parse storage value: {}", e))?;
 
             if let Some(account) = accounts_hash_map.get(&storage_addr_felt) {
                 let balance_felt = Felt::from_hex(&storage_val).unwrap_or_else(|_| Felt::ZERO);
@@ -201,9 +193,32 @@ async fn main() -> Result<(), Error> {
 
         token_map.insert(token.clone(), balance_map);
     }
-    store_map_as_csv(&token_map).expect("Failed to store map as CSV");
-    store_map_as_json(&token_map).expect("Failed to store map as JSON");
-    store_map_in_sqlite(&token_map).expect("Failed to store map in SQLite");
+
+    Ok(token_map)
+}
+
+#[tokio::main]
+async fn main() -> eyre::Result<()> {
+    // Load environment variables from .env file
+    dotenv::dotenv().ok();
+
+    let input_file = env::var("INPUT_FILE").expect("INPUT_FILE not set");
+
+    // Read and parse the JSON file
+    let file_content = std::fs::read_to_string(input_file).expect("Failed to read JSON file");
+    let addresses: Addresses =
+        serde_json::from_str(&file_content).expect("Failed to parse JSON file");
+
+    let db_path = env::var("DB_PATH").expect("DB_PATH not set");
+
+    // Open a connection to the SQLite database
+    let conn = Connection::open(&db_path).expect("Failed to open database");
+
+    let token_map = get_balance_map(&conn, &addresses)?;
+
+    store_map_as_csv(&token_map).map_err(|e| eyre::eyre!("Failed to store map as CSV: {}", e))?;
+    store_map_as_json(&token_map).map_err(|e| eyre::eyre!("Failed to store map as JSON: {}", e))?;
+    store_map_in_sqlite(&token_map)?;
 
     Ok(())
 }

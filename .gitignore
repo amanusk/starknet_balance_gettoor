@@ -11,3 +11,5 @@ target
 *.csv
 *.json
 *.db
+
+addresses.json
