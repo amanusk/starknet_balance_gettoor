@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn test_get_balance_map_empty_result() -> eyre::Result<()> {
         // Create test database with temporary file
-        let (conn, _temp_file)g = create_test_database()?;
+        let (conn, _temp_file) = create_test_database()?;
         insert_test_data(&conn)?;
 
         // Create test addresses with non-existent token
