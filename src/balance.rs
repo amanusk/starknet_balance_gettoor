@@ -157,10 +157,7 @@ pub fn get_balance_map(
     // Print summary for each token
     for token in &addresses.tokens {
         let balance_count = final_token_map.get(token).map(|m| m.len()).unwrap_or(0);
-        println!(
-            "#### Token: {token:#064x} - {} balances ######",
-            balance_count
-        );
+        println!("#### Token: {token:#064x} - {balance_count} balances ######");
     }
 
     Ok(final_token_map)
@@ -320,7 +317,7 @@ mod tests {
     #[test]
     fn test_get_balance_map_empty_result() -> eyre::Result<()> {
         // Create test database with temporary file
-        let (conn, _temp_file) = create_test_database()?;
+        let (conn, _temp_file)g = create_test_database()?;
         insert_test_data(&conn)?;
 
         // Create test addresses with non-existent token

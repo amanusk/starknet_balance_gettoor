@@ -177,8 +177,8 @@ fn store_map_in_sqlite(token_map: &HashMap<Felt, HashMap<Felt, Felt>>) -> eyre::
                 .par_iter()
                 .map(|(account, balance)| {
                     (
-                        format!("{:#064x}", token),
-                        format!("{:#064x}", account),
+                        format!("{token:#064x}"),
+                        format!("{account:#064x}"),
                         balance.to_string(),
                     )
                 })
