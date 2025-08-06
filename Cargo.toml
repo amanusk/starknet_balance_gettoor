@@ -16,5 +16,6 @@ csv = "1.1"
 eyre = "0.6"
 clap = { version = "4.0", features = ["derive", "env"] }
 hex = "0.4"
+tempfile = "3.8"
 
 

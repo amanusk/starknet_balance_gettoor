@@ -12,14 +12,27 @@ pub struct Addresses {
     pub tokens: Vec<Felt>,
 }
 
+// Helper function to create a new database connection
+fn create_connection(db_path: &str) -> Result<Connection> {
+    Connection::open(db_path)
+        .map_err(|e| eyre::eyre!("Failed to create database connection: {}", e))
+}
+
 pub fn get_balance_map(
     conn: &Connection,
     addresses: &Addresses,
 ) -> Result<HashMap<Felt, HashMap<Felt, Felt>>> {
     let total_start = std::time::SystemTime::now();
 
+    // Get the database path from the connection
+    let db_path = conn
+        .path()
+        .ok_or_else(|| eyre::eyre!("Database connection has no path"))?
+        .to_string();
+
     let balances_selector = starknet_keccak("ERC20_balances".as_bytes());
 
+    // Step 1: Create accounts hash map (single-threaded, fast)
     let hashing_start = std::time::SystemTime::now();
     let accounts_hash_map: HashMap<Felt, Felt> = addresses
         .accounts
@@ -29,167 +42,90 @@ pub fn get_balance_map(
             (val, *item)
         })
         .collect();
-
     let hashing_end = std::time::SystemTime::now();
     let hash_time = hashing_end.duration_since(hashing_start).unwrap();
     println!("Hashing time: {:?} ms", hash_time.as_millis());
 
-    // Optimize: Single batched query for all tokens instead of sequential queries
-    let batch_query_start = std::time::SystemTime::now();
-
-    // Create placeholders for all tokens in the IN clause
-    let token_placeholders = addresses
-        .tokens
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("?{}", i + 1))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let batch_query = format!(
-        r#"
-        SELECT
-            hex(contract_addresses.contract_address),
-            hex(storage_addresses.storage_address),
-            hex(storage_value),
-            MAX(block_number)
-        FROM
-            storage_updates
-            JOIN storage_addresses
-                ON storage_addresses.id = storage_updates.storage_address_id
-            JOIN contract_addresses
-                ON contract_addresses.id = storage_updates.contract_address_id
-        WHERE
-            contract_address IN ({})
-            GROUP BY
-            contract_address_id,
-            storage_address_id
-        "#,
-        token_placeholders
-    );
-
-    let mut stmt = conn
-        .prepare(&batch_query)
-        .map_err(|e| eyre::eyre!("Failed to prepare batched SQL statement: {}", e))?;
-
-    // Convert tokens to hex bytes for the query parameters
-    let token_params: Vec<Vec<u8>> = addresses
-        .tokens
-        .iter()
-        .map(|token| {
-            let token_hex = format!("{token:#064x}")[2..].to_string();
-            hex::decode(&token_hex).unwrap_or_default()
-        })
-        .collect();
-
-    // Create parameter references for the query
-    let param_refs: Vec<&dyn rusqlite::ToSql> = token_params
-        .iter()
-        .map(|p| p as &dyn rusqlite::ToSql)
-        .collect();
-
-    let batch_query_end = std::time::SystemTime::now();
-    let batch_query_time = batch_query_end.duration_since(batch_query_start).unwrap();
-    println!(
-        "Batch query preparation time: {:?} ms",
-        batch_query_time.as_millis()
-    );
-
-    // Execute the batched query
-    let execution_start = std::time::SystemTime::now();
-    let rows = stmt
-        .query_map(&param_refs[..], |row| {
-            let contract_address_hex: String = row.get(0)?;
-            let storage_address_hex: String = row.get(1)?;
-            let storage_value_hex: String = row.get(2)?;
-            let max_block_number: i64 = row.get(3)?;
-
-            Ok((
-                contract_address_hex,
-                storage_address_hex,
-                storage_value_hex,
-                max_block_number,
-            ))
-        })
-        .map_err(|e| eyre::eyre!("Failed to execute batched query: {}", e))?;
-
-    let execution_end = std::time::SystemTime::now();
-    let execution_time = execution_end.duration_since(execution_start).unwrap();
-    println!(
-        "Batch query execution time: {:?} ms",
-        execution_time.as_millis()
-    );
-
-    // Process results and group by token
-    let processing_start = std::time::SystemTime::now();
-
-    // Create a map from hex contract address to token Felt
-    let contract_to_token_start = std::time::SystemTime::now();
-    let contract_to_token: HashMap<String, Felt> = addresses
-        .tokens
-        .iter()
-        .map(|token| {
-            let token_hex = format!("{token:#064x}")[2..].to_string();
-            (token_hex.to_uppercase(), *token)
-        })
-        .collect();
-    let contract_to_token_end = std::time::SystemTime::now();
-    let contract_to_token_time = contract_to_token_end
-        .duration_since(contract_to_token_start)
-        .unwrap();
-    println!(
-        "Contract to token mapping time: {:?} ms",
-        contract_to_token_time.as_millis()
-    );
-
-    // Collect all rows first to enable parallel processing
-    let row_collection_start = std::time::SystemTime::now();
-    let all_rows: Result<Vec<_>, _> = rows.collect();
-    let all_rows = all_rows.map_err(|e| eyre::eyre!("Failed to collect rows: {}", e))?;
-    let row_collection_end = std::time::SystemTime::now();
-    let row_collection_time = row_collection_end
-        .duration_since(row_collection_start)
-        .unwrap();
-    println!(
-        "Row collection time: {:?} ms",
-        row_collection_time.as_millis()
-    );
-
-    println!("Collected {} total rows for processing", all_rows.len());
-
-    // Process all rows in parallel and group by token
+    // Step 2: Process each token in parallel
     let parallel_processing_start = std::time::SystemTime::now();
 
-    let grouped_results: HashMap<Felt, Vec<(Felt, Felt)>> = all_rows
+    let token_results: Vec<Result<(Felt, HashMap<Felt, Felt>)>> = addresses
+        .tokens
         .par_iter()
-        .filter_map(|(contract_address_hex, storage_addr, storage_val, _)| {
-            // Find which token this row belongs to
-            let token = contract_to_token.get(&contract_address_hex.to_uppercase())?;
+        .map(|token| {
+            // Create a new connection for this token
+            let token_conn = create_connection(&db_path)?;
 
-            let storage_str = format!("0x{storage_addr}");
-            let storage_addr_felt = Felt::from_hex(&storage_str).ok()?;
-            let account = accounts_hash_map.get(&storage_addr_felt)?;
-            let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
+            // Create placeholders for this token
+            let token_hex = format!("{token:#064x}")[2..].to_string();
+            let token_bytes = hex::decode(&token_hex).unwrap_or_default();
 
-            Some((*token, (*account, balance_felt)))
-        })
-        .fold(
-            HashMap::new,
-            |mut acc: HashMap<Felt, Vec<(Felt, Felt)>>, (token, account_balance)| {
-                acc.entry(token)
-                    .or_insert_with(Vec::new)
-                    .push(account_balance);
-                acc
-            },
-        )
-        .reduce(HashMap::new, |mut acc, local_map| {
-            for (token, mut balances) in local_map {
-                acc.entry(token)
-                    .or_insert_with(Vec::new)
-                    .append(&mut balances);
+            let batch_query = r#"
+                SELECT
+                    hex(contract_addresses.contract_address),
+                    hex(storage_addresses.storage_address),
+                    hex(storage_value),
+                    MAX(block_number)
+                FROM
+                    storage_updates
+                    JOIN storage_addresses
+                        ON storage_addresses.id = storage_updates.storage_address_id
+                    JOIN contract_addresses
+                        ON contract_addresses.id = storage_updates.contract_address_id
+                WHERE
+                    contract_address = ?
+                GROUP BY
+                    contract_address_id,
+                    storage_address_id
+            "#;
+
+            let mut stmt = token_conn
+                .prepare(batch_query)
+                .map_err(|e| eyre::eyre!("Failed to prepare SQL statement: {}", e))?;
+
+            // Execute the query for this token
+            let rows = stmt
+                .query_map([&token_bytes as &dyn rusqlite::ToSql], |row| {
+                    let contract_address_hex: String = row.get(0)?;
+                    let storage_address_hex: String = row.get(1)?;
+                    let storage_value_hex: String = row.get(2)?;
+                    let max_block_number: i64 = row.get(3)?;
+
+                    Ok((
+                        contract_address_hex,
+                        storage_address_hex,
+                        storage_value_hex,
+                        max_block_number,
+                    ))
+                })
+                .map_err(|e| eyre::eyre!("Failed to execute query: {}", e))?;
+
+            // Collect all rows for this token
+            let all_rows: Result<Vec<_>, _> = rows.collect();
+            let all_rows = all_rows.map_err(|e| eyre::eyre!("Failed to collect rows: {}", e))?;
+
+            // Process rows for this token
+            let mut token_balances: HashMap<Felt, Felt> = HashMap::new();
+
+            for (_contract_address_hex, storage_addr, storage_val, _) in all_rows {
+                let storage_str = format!("0x{storage_addr}");
+                let storage_addr_felt = match Felt::from_hex(&storage_str) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+
+                let account = match accounts_hash_map.get(&storage_addr_felt) {
+                    Some(a) => a,
+                    None => continue,
+                };
+
+                let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
+                token_balances.insert(*account, balance_felt);
             }
-            acc
-        });
+
+            Ok((*token, token_balances))
+        })
+        .collect();
 
     let parallel_processing_end = std::time::SystemTime::now();
     let parallel_processing_time = parallel_processing_end
@@ -200,33 +136,19 @@ pub fn get_balance_map(
         parallel_processing_time.as_millis()
     );
 
-    // Convert grouped results to final HashMap structure
-    let conversion_start = std::time::SystemTime::now();
+    // Step 3: Merge results from all tokens
+    let merging_start = std::time::SystemTime::now();
 
-    let mut token_map: HashMap<Felt, HashMap<Felt, Felt>> = addresses
-        .tokens
-        .iter()
-        .map(|token| (*token, HashMap::new()))
-        .collect();
+    let mut final_token_map: HashMap<Felt, HashMap<Felt, Felt>> = HashMap::new();
 
-    for (token, account_balances) in grouped_results {
-        if let Some(balance_map) = token_map.get_mut(&token) {
-            for (account, balance) in account_balances {
-                balance_map.insert(account, balance);
-            }
-        }
+    for token_result in token_results {
+        let (token, balances) = token_result?;
+        final_token_map.insert(token, balances);
     }
 
-    let conversion_end = std::time::SystemTime::now();
-    let conversion_time = conversion_end.duration_since(conversion_start).unwrap();
-    println!("Conversion time: {:?} ms", conversion_time.as_millis());
-
-    let processing_end = std::time::SystemTime::now();
-    let processing_time = processing_end.duration_since(processing_start).unwrap();
-    println!(
-        "Total result processing time: {:?} ms",
-        processing_time.as_millis()
-    );
+    let merging_end = std::time::SystemTime::now();
+    let merging_time = merging_end.duration_since(merging_start).unwrap();
+    println!("Result merging time: {:?} ms", merging_time.as_millis());
 
     let total_end = std::time::SystemTime::now();
     let total_time = total_end.duration_since(total_start).unwrap();
@@ -234,23 +156,25 @@ pub fn get_balance_map(
 
     // Print summary for each token
     for token in &addresses.tokens {
-        let balance_count = token_map.get(token).map(|m| m.len()).unwrap_or(0);
+        let balance_count = final_token_map.get(token).map(|m| m.len()).unwrap_or(0);
         println!(
             "#### Token: {token:#064x} - {} balances ######",
             balance_count
         );
     }
 
-    Ok(token_map)
+    Ok(final_token_map)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::Connection as TestConnection;
+    use tempfile::NamedTempFile;
 
-    fn create_test_database() -> eyre::Result<TestConnection> {
-        let conn = TestConnection::open_in_memory()?;
+    fn create_test_database() -> eyre::Result<(TestConnection, NamedTempFile)> {
+        let temp_file = NamedTempFile::new()?;
+        let conn = TestConnection::open(temp_file.path())?;
 
         // Create the tables according to the schema used in the query
         conn.execute(
@@ -282,7 +206,7 @@ mod tests {
             [],
         )?;
 
-        Ok(conn)
+        Ok((conn, temp_file))
     }
 
     fn insert_test_data(conn: &TestConnection) -> eyre::Result<()> {
@@ -335,8 +259,8 @@ mod tests {
 
     #[test]
     fn test_get_balance_map() -> eyre::Result<()> {
-        // Create test database
-        let conn = create_test_database()?;
+        // Create test database with temporary file
+        let (conn, _temp_file) = create_test_database()?;
         insert_test_data(&conn)?;
 
         // Create test addresses with only one token to simplify the test
@@ -395,8 +319,8 @@ mod tests {
 
     #[test]
     fn test_get_balance_map_empty_result() -> eyre::Result<()> {
-        // Create test database
-        let conn = create_test_database()?;
+        // Create test database with temporary file
+        let (conn, _temp_file) = create_test_database()?;
         insert_test_data(&conn)?;
 
         // Create test addresses with non-existent token
