@@ -33,8 +33,7 @@ struct Args {
     sqlite: bool,
 }
 
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
+fn main() -> eyre::Result<()> {
     // Load environment variables from .env file
     dotenv::dotenv().ok();
 
