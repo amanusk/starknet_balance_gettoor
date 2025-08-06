@@ -16,6 +16,8 @@ pub fn get_balance_map(
     conn: &Connection,
     addresses: &Addresses,
 ) -> Result<HashMap<Felt, HashMap<Felt, Felt>>> {
+    let total_start = std::time::SystemTime::now();
+
     let balances_selector = starknet_keccak("ERC20_balances".as_bytes());
 
     let hashing_start = std::time::SystemTime::now();
@@ -30,7 +32,7 @@ pub fn get_balance_map(
 
     let hashing_end = std::time::SystemTime::now();
     let hash_time = hashing_end.duration_since(hashing_start).unwrap();
-    println!("Hashing time: {:?}", hash_time.as_millis());
+    println!("Hashing time: {:?} ms", hash_time.as_millis());
 
     // Optimize: Single batched query for all tokens instead of sequential queries
     let batch_query_start = std::time::SystemTime::now();
@@ -89,7 +91,7 @@ pub fn get_balance_map(
     let batch_query_end = std::time::SystemTime::now();
     let batch_query_time = batch_query_end.duration_since(batch_query_start).unwrap();
     println!(
-        "Batch query preparation time: {:?}",
+        "Batch query preparation time: {:?} ms",
         batch_query_time.as_millis()
     );
 
@@ -114,7 +116,7 @@ pub fn get_balance_map(
     let execution_end = std::time::SystemTime::now();
     let execution_time = execution_end.duration_since(execution_start).unwrap();
     println!(
-        "Batch query execution time: {:?}",
+        "Batch query execution time: {:?} ms",
         execution_time.as_millis()
     );
 
@@ -122,6 +124,7 @@ pub fn get_balance_map(
     let processing_start = std::time::SystemTime::now();
 
     // Create a map from hex contract address to token Felt
+    let contract_to_token_start = std::time::SystemTime::now();
     let contract_to_token: HashMap<String, Felt> = addresses
         .tokens
         .iter()
@@ -130,10 +133,27 @@ pub fn get_balance_map(
             (token_hex.to_uppercase(), *token)
         })
         .collect();
+    let contract_to_token_end = std::time::SystemTime::now();
+    let contract_to_token_time = contract_to_token_end
+        .duration_since(contract_to_token_start)
+        .unwrap();
+    println!(
+        "Contract to token mapping time: {:?} ms",
+        contract_to_token_time.as_millis()
+    );
 
     // Collect all rows first to enable parallel processing
+    let row_collection_start = std::time::SystemTime::now();
     let all_rows: Result<Vec<_>, _> = rows.collect();
     let all_rows = all_rows.map_err(|e| eyre::eyre!("Failed to collect rows: {}", e))?;
+    let row_collection_end = std::time::SystemTime::now();
+    let row_collection_time = row_collection_end
+        .duration_since(row_collection_start)
+        .unwrap();
+    println!(
+        "Row collection time: {:?} ms",
+        row_collection_time.as_millis()
+    );
 
     println!("Collected {} total rows for processing", all_rows.len());
 
@@ -176,7 +196,7 @@ pub fn get_balance_map(
         .duration_since(parallel_processing_start)
         .unwrap();
     println!(
-        "Parallel processing time: {:?}",
+        "Parallel processing time: {:?} ms",
         parallel_processing_time.as_millis()
     );
 
@@ -199,14 +219,18 @@ pub fn get_balance_map(
 
     let conversion_end = std::time::SystemTime::now();
     let conversion_time = conversion_end.duration_since(conversion_start).unwrap();
-    println!("Conversion time: {:?}", conversion_time.as_millis());
+    println!("Conversion time: {:?} ms", conversion_time.as_millis());
 
     let processing_end = std::time::SystemTime::now();
     let processing_time = processing_end.duration_since(processing_start).unwrap();
     println!(
-        "Total result processing time: {:?}",
+        "Total result processing time: {:?} ms",
         processing_time.as_millis()
     );
+
+    let total_end = std::time::SystemTime::now();
+    let total_time = total_end.duration_since(total_start).unwrap();
+    println!("Total function time: {:?} ms", total_time.as_millis());
 
     // Print summary for each token
     for token in &addresses.tokens {
