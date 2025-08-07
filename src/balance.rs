@@ -49,6 +49,17 @@ pub fn get_balance_map(
     // Step 2: Process each token in parallel
     let parallel_processing_start = std::time::SystemTime::now();
 
+    let num_tokens = addresses.tokens.len();
+    let num_cores = rayon::current_num_threads();
+    println!(
+        "Processing {} tokens using {} CPU cores",
+        num_tokens, num_cores
+    );
+    println!(
+        "Creating {} database connections (one per token)",
+        num_tokens
+    );
+
     let token_results: Vec<Result<(Felt, HashMap<Felt, Felt>)>> = addresses
         .tokens
         .par_iter()
