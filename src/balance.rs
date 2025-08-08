@@ -18,6 +18,11 @@ fn create_connection(db_path: &str) -> Result<Connection> {
         .map_err(|e| eyre::eyre!("Failed to create database connection: {}", e))
 }
 
+// Helper function to convert binary data to hex string
+fn binary_to_hex(binary_data: &[u8]) -> String {
+    hex::encode(binary_data)
+}
+
 pub fn get_balance_map(
     conn: &Connection,
     addresses: &Addresses,
@@ -69,7 +74,7 @@ pub fn get_balance_map(
             let token_bytes = hex::decode(&token_hex).unwrap_or_default();
 
             // Run shards in parallel for this token
-            type ShardRow = (String, String, String, i64);
+            type ShardRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64);
             let shard_results: Vec<Result<Vec<ShardRow>>> = (0..shards_per_token)
                 .into_par_iter()
                 .map(|shard_idx| {
@@ -77,11 +82,12 @@ pub fn get_balance_map(
                     let shard_conn = create_connection(&db_path)?;
 
                     // Partition on storage_addresses.id modulo shards_per_token
+                    // Modified query to return raw binary data instead of hex strings
                     let batch_query = r#"
                             SELECT
-                                hex(contract_addresses.contract_address),
-                                hex(storage_addresses.storage_address),
-                                hex(storage_value),
+                                contract_addresses.contract_address,
+                                storage_addresses.storage_address,
+                                storage_value,
                                 MAX(block_number)
                             FROM
                                 storage_updates
@@ -109,14 +115,14 @@ pub fn get_balance_map(
                                 shard_idx as i64
                             ],
                             |row| {
-                                let contract_address_hex: String = row.get(0)?;
-                                let storage_address_hex: String = row.get(1)?;
-                                let storage_value_hex: String = row.get(2)?;
+                                let contract_address_binary: Vec<u8> = row.get(0)?;
+                                let storage_address_binary: Vec<u8> = row.get(1)?;
+                                let storage_value_binary: Vec<u8> = row.get(2)?;
                                 let max_block_number: i64 = row.get(3)?;
                                 Ok((
-                                    contract_address_hex,
-                                    storage_address_hex,
-                                    storage_value_hex,
+                                    contract_address_binary,
+                                    storage_address_binary,
+                                    storage_value_binary,
                                     max_block_number,
                                 ))
                             },
@@ -134,8 +140,16 @@ pub fn get_balance_map(
             // Process rows for this token aggregated from all shards
             let mut token_balances: HashMap<Felt, Felt> = HashMap::new();
             for shard_rows in shard_results {
-                for (_contract_address_hex, storage_addr, storage_val, _max_block) in shard_rows? {
-                    let storage_str = format!("0x{storage_addr}");
+                for (
+                    _contract_address_binary,
+                    storage_addr_binary,
+                    storage_val_binary,
+                    _max_block,
+                ) in shard_rows?
+                {
+                    // Convert binary storage address to hex string in Rust
+                    let storage_addr_hex = binary_to_hex(&storage_addr_binary);
+                    let storage_str = format!("0x{storage_addr_hex}");
                     let storage_addr_felt = match Felt::from_hex(&storage_str) {
                         Ok(f) => f,
                         Err(_) => continue,
@@ -146,7 +160,9 @@ pub fn get_balance_map(
                         None => continue,
                     };
 
-                    let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
+                    // Convert binary storage value to hex string in Rust
+                    let storage_val_hex = binary_to_hex(&storage_val_binary);
+                    let balance_felt = Felt::from_hex(&storage_val_hex).unwrap_or(Felt::ZERO);
                     token_balances.insert(*account, balance_felt);
                 }
             }
