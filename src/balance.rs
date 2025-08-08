@@ -69,7 +69,7 @@ pub fn get_balance_map(
             let token_bytes = hex::decode(&token_hex).unwrap_or_default();
 
             // Run shards in parallel for this token
-            type ShardRow = (String, String, String, i64);
+            type ShardRow = (Vec<u8>, Vec<u8>);
             let shard_results: Vec<Result<Vec<ShardRow>>> = (0..shards_per_token)
                 .into_par_iter()
                 .map(|shard_idx| {
@@ -79,22 +79,25 @@ pub fn get_balance_map(
                     // Partition on storage_addresses.id modulo shards_per_token
                     let batch_query = r#"
                             SELECT
-                                hex(contract_addresses.contract_address),
-                                hex(storage_addresses.storage_address),
-                                hex(storage_value),
-                                MAX(block_number)
+                                sa.storage_address,
+                                su.storage_value
                             FROM
-                                storage_updates
-                                JOIN storage_addresses
-                                    ON storage_addresses.id = storage_updates.storage_address_id
-                                JOIN contract_addresses
-                                    ON contract_addresses.id = storage_updates.contract_address_id
+                                storage_updates su
+                            JOIN storage_addresses sa
+                                ON sa.id = su.storage_address_id
+                            JOIN contract_addresses c
+                                ON c.id = su.contract_address_id
+                               AND c.contract_address = ?1
+                            JOIN (
+                                SELECT contract_address_id, storage_address_id, MAX(block_number) AS max_block
+                                FROM storage_updates
+                                GROUP BY contract_address_id, storage_address_id
+                            ) m
+                                ON m.contract_address_id = su.contract_address_id
+                               AND m.storage_address_id  = su.storage_address_id
+                               AND m.max_block           = su.block_number
                             WHERE
-                                contract_address = ?1
-                                AND (storage_addresses.id % ?2) = ?3
-                            GROUP BY
-                                contract_address_id,
-                                storage_address_id
+                                (sa.id % ?2) = ?3
                         "#;
 
                     let mut stmt = shard_conn
@@ -109,16 +112,9 @@ pub fn get_balance_map(
                                 shard_idx as i64
                             ],
                             |row| {
-                                let contract_address_hex: String = row.get(0)?;
-                                let storage_address_hex: String = row.get(1)?;
-                                let storage_value_hex: String = row.get(2)?;
-                                let max_block_number: i64 = row.get(3)?;
-                                Ok((
-                                    contract_address_hex,
-                                    storage_address_hex,
-                                    storage_value_hex,
-                                    max_block_number,
-                                ))
+                                let storage_address_blob: Vec<u8> = row.get(0)?;
+                                let storage_value_blob: Vec<u8> = row.get(1)?;
+                                Ok((storage_address_blob, storage_value_blob))
                             },
                         )
                         .map_err(|e| eyre::eyre!("Failed to execute query: {}", e))?;
@@ -132,11 +128,15 @@ pub fn get_balance_map(
                 .collect();
 
             // Process rows for this token aggregated from all shards
-            let mut token_balances: HashMap<Felt, Felt> = HashMap::new();
+            let mut token_balances: HashMap<Felt, Felt> =
+                HashMap::with_capacity(addresses.accounts.len());
             for shard_rows in shard_results {
-                for (_contract_address_hex, storage_addr, storage_val, _max_block) in shard_rows? {
-                    let storage_str = format!("0x{storage_addr}");
-                    let storage_addr_felt = match Felt::from_hex(&storage_str) {
+                for (storage_addr_blob, storage_val_blob) in shard_rows? {
+                    // Convert BLOB -> Felt; fall back to hex encoding if direct bytes API is unavailable
+                    let storage_addr_felt = match Felt::from_hex(&format!(
+                        "0x{}",
+                        hex::encode(&storage_addr_blob)
+                    )) {
                         Ok(f) => f,
                         Err(_) => continue,
                     };
@@ -146,7 +146,11 @@ pub fn get_balance_map(
                         None => continue,
                     };
 
-                    let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
+                    let balance_felt = Felt::from_hex(&format!(
+                        "0x{}",
+                        hex::encode(&storage_val_blob)
+                    ))
+                    .unwrap_or(Felt::ZERO);
                     token_balances.insert(*account, balance_felt);
                 }
             }
