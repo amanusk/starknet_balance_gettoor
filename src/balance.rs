@@ -49,78 +49,106 @@ pub fn get_balance_map(
     // Step 2: Process each token in parallel
     let parallel_processing_start = std::time::SystemTime::now();
 
+    let num_tokens = addresses.tokens.len();
+    let num_cores = rayon::current_num_threads();
+    println!("Processing {num_tokens} tokens using {num_cores} CPU cores");
+    // Determine how many shards (DB partitions) to use per token to saturate all cores
+    let shards_per_token = std::cmp::max(1, num_cores / std::cmp::max(1, num_tokens));
+    println!(
+        "Using {} shards per token ({} total concurrent DB connections)",
+        shards_per_token,
+        shards_per_token * std::cmp::max(1, num_tokens)
+    );
+
     let token_results: Vec<Result<(Felt, HashMap<Felt, Felt>)>> = addresses
         .tokens
         .par_iter()
         .map(|token| {
-            // Create a new connection for this token
-            let token_conn = create_connection(&db_path)?;
-
             // Create placeholders for this token
             let token_hex = format!("{token:#064x}")[2..].to_string();
             let token_bytes = hex::decode(&token_hex).unwrap_or_default();
 
-            let batch_query = r#"
-                SELECT
-                    hex(contract_addresses.contract_address),
-                    hex(storage_addresses.storage_address),
-                    hex(storage_value),
-                    MAX(block_number)
-                FROM
-                    storage_updates
-                    JOIN storage_addresses
-                        ON storage_addresses.id = storage_updates.storage_address_id
-                    JOIN contract_addresses
-                        ON contract_addresses.id = storage_updates.contract_address_id
-                WHERE
-                    contract_address = ?
-                GROUP BY
-                    contract_address_id,
-                    storage_address_id
-            "#;
+            // Run shards in parallel for this token
+            type ShardRow = (String, String, String, i64);
+            let shard_results: Vec<Result<Vec<ShardRow>>> = (0..shards_per_token)
+                .into_par_iter()
+                .map(|shard_idx| {
+                    // Each shard uses its own DB connection
+                    let shard_conn = create_connection(&db_path)?;
 
-            let mut stmt = token_conn
-                .prepare(batch_query)
-                .map_err(|e| eyre::eyre!("Failed to prepare SQL statement: {}", e))?;
+                    // Partition on storage_addresses.id modulo shards_per_token
+                    let batch_query = r#"
+                            SELECT
+                                hex(contract_addresses.contract_address),
+                                hex(storage_addresses.storage_address),
+                                hex(storage_value),
+                                MAX(block_number)
+                            FROM
+                                storage_updates
+                                JOIN storage_addresses
+                                    ON storage_addresses.id = storage_updates.storage_address_id
+                                JOIN contract_addresses
+                                    ON contract_addresses.id = storage_updates.contract_address_id
+                            WHERE
+                                contract_address = ?1
+                                AND (storage_addresses.id % ?2) = ?3
+                            GROUP BY
+                                contract_address_id,
+                                storage_address_id
+                        "#;
 
-            // Execute the query for this token
-            let rows = stmt
-                .query_map([&token_bytes as &dyn rusqlite::ToSql], |row| {
-                    let contract_address_hex: String = row.get(0)?;
-                    let storage_address_hex: String = row.get(1)?;
-                    let storage_value_hex: String = row.get(2)?;
-                    let max_block_number: i64 = row.get(3)?;
+                    let mut stmt = shard_conn
+                        .prepare(batch_query)
+                        .map_err(|e| eyre::eyre!("Failed to prepare SQL statement: {}", e))?;
 
-                    Ok((
-                        contract_address_hex,
-                        storage_address_hex,
-                        storage_value_hex,
-                        max_block_number,
-                    ))
+                    let rows = stmt
+                        .query_map(
+                            rusqlite::params![
+                                &token_bytes,
+                                shards_per_token as i64,
+                                shard_idx as i64
+                            ],
+                            |row| {
+                                let contract_address_hex: String = row.get(0)?;
+                                let storage_address_hex: String = row.get(1)?;
+                                let storage_value_hex: String = row.get(2)?;
+                                let max_block_number: i64 = row.get(3)?;
+                                Ok((
+                                    contract_address_hex,
+                                    storage_address_hex,
+                                    storage_value_hex,
+                                    max_block_number,
+                                ))
+                            },
+                        )
+                        .map_err(|e| eyre::eyre!("Failed to execute query: {}", e))?;
+
+                    // Collect all rows for this shard
+                    let all_rows: Result<Vec<_>, _> = rows.collect();
+                    let all_rows =
+                        all_rows.map_err(|e| eyre::eyre!("Failed to collect rows: {}", e))?;
+                    Ok(all_rows)
                 })
-                .map_err(|e| eyre::eyre!("Failed to execute query: {}", e))?;
+                .collect();
 
-            // Collect all rows for this token
-            let all_rows: Result<Vec<_>, _> = rows.collect();
-            let all_rows = all_rows.map_err(|e| eyre::eyre!("Failed to collect rows: {}", e))?;
-
-            // Process rows for this token
+            // Process rows for this token aggregated from all shards
             let mut token_balances: HashMap<Felt, Felt> = HashMap::new();
+            for shard_rows in shard_results {
+                for (_contract_address_hex, storage_addr, storage_val, _max_block) in shard_rows? {
+                    let storage_str = format!("0x{storage_addr}");
+                    let storage_addr_felt = match Felt::from_hex(&storage_str) {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
 
-            for (_contract_address_hex, storage_addr, storage_val, _) in all_rows {
-                let storage_str = format!("0x{storage_addr}");
-                let storage_addr_felt = match Felt::from_hex(&storage_str) {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
+                    let account = match accounts_hash_map.get(&storage_addr_felt) {
+                        Some(a) => a,
+                        None => continue,
+                    };
 
-                let account = match accounts_hash_map.get(&storage_addr_felt) {
-                    Some(a) => a,
-                    None => continue,
-                };
-
-                let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
-                token_balances.insert(*account, balance_felt);
+                    let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
+                    token_balances.insert(*account, balance_felt);
+                }
             }
 
             Ok((*token, token_balances))
@@ -345,6 +373,144 @@ mod tests {
         );
 
         println!("Empty result test passed successfully!");
+        Ok(())
+    }
+
+    #[test]
+    fn test_sharding_max_block_number_issue() -> eyre::Result<()> {
+        // Create test database with temporary file
+        let (conn, _temp_file) = create_test_database()?;
+
+        // Insert contract address
+        conn.execute(
+            "INSERT INTO contract_addresses (id, contract_address) VALUES (1, ?)",
+            [vec![
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+                0x1d, 0x1e, 0x1f, 0x20,
+            ]],
+        )?;
+
+        // Insert storage addresses with IDs that will be distributed across shards
+        // For 2 shards: id=1 % 2 = 1, id=2 % 2 = 0, id=3 % 2 = 1, id=4 % 2 = 0
+        conn.execute(
+            "INSERT INTO storage_addresses (id, storage_address) VALUES (1, ?)",
+            [vec![
+                0x00, 0xfb, 0x35, 0xd6, 0x8f, 0xaa, 0x85, 0xe6, 0xa5, 0xd2, 0xf4, 0xec, 0x1b, 0xb9,
+                0x96, 0x92, 0x89, 0x42, 0xab, 0x83, 0x17, 0x83, 0xb0, 0x22, 0x0d, 0x70, 0x74, 0xce,
+                0xf4, 0x2a, 0x0d, 0xe1,
+            ]],
+        )?;
+        conn.execute(
+            "INSERT INTO storage_addresses (id, storage_address) VALUES (2, ?)",
+            [vec![
+                0x07, 0x77, 0xe9, 0xa0, 0xc5, 0xc0, 0x9c, 0x28, 0x62, 0xd1, 0x69, 0x7e, 0x51, 0xdc,
+                0x5d, 0x7d, 0xd5, 0xa3, 0xa9, 0x8f, 0x50, 0x25, 0x0b, 0xe5, 0xde, 0xbb, 0x7f, 0x49,
+                0xc2, 0x10, 0x9e, 0xde,
+            ]],
+        )?;
+        conn.execute(
+            "INSERT INTO storage_addresses (id, storage_address) VALUES (3, ?)",
+            [vec![
+                0x08, 0x88, 0xfa, 0xb1, 0xd6, 0xc1, 0x0d, 0x39, 0x73, 0xe2, 0x7a, 0x8f, 0x62, 0xed,
+                0x6e, 0x8e, 0xe6, 0xb4, 0xba, 0xa0, 0x61, 0x36, 0x1c, 0xf6, 0xef, 0xcc, 0x90, 0x5a,
+                0xd3, 0x21, 0xaf, 0xef,
+            ]],
+        )?;
+        conn.execute(
+            "INSERT INTO storage_addresses (id, storage_address) VALUES (4, ?)",
+            [vec![
+                0x09, 0x99, 0x0b, 0xc2, 0xe7, 0xd2, 0x1e, 0x4a, 0x84, 0xf3, 0x8b, 0xa0, 0x73, 0xfe,
+                0x7f, 0x9f, 0xf7, 0xc5, 0xcb, 0xb1, 0x72, 0x47, 0x2d, 0x07, 0x00, 0xdd, 0xa1, 0x6b,
+                0xe4, 0x32, 0xc0, 0x00,
+            ]],
+        )?;
+
+        // Insert multiple storage updates for the same storage_address_id with different block numbers
+        // This tests if sharding correctly finds the MAX(block_number) across all shards
+
+        // Storage address 1 (id=1, shard 1): old update
+        conn.execute(
+            "INSERT INTO storage_updates (contract_address_id, storage_address_id, storage_value, block_number) VALUES (1, 1, ?, 100)",
+            [vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xe8]], // 1000
+        )?;
+
+        // Storage address 1 (id=1, shard 1): newer update - should be the one returned
+        conn.execute(
+            "INSERT INTO storage_updates (contract_address_id, storage_address_id, storage_value, block_number) VALUES (1, 1, ?, 200)",
+            [vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xd0]], // 2000
+        )?;
+
+        // Storage address 2 (id=2, shard 0): old update
+        conn.execute(
+            "INSERT INTO storage_updates (contract_address_id, storage_address_id, storage_value, block_number) VALUES (1, 2, ?, 150)",
+            [vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0xb8]], // 3000
+        )?;
+
+        // Storage address 2 (id=2, shard 0): newer update - should be the one returned
+        conn.execute(
+            "INSERT INTO storage_updates (contract_address_id, storage_address_id, storage_value, block_number) VALUES (1, 2, ?, 250)",
+            [vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x88]], // 5000
+        )?;
+
+        // Create test addresses
+        let addresses = Addresses {
+            accounts: vec![
+                Felt::from_hex(
+                    "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+                )?,
+                Felt::from_hex(
+                    "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                )?,
+            ],
+            tokens: vec![Felt::from_hex(
+                "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+            )?],
+        };
+
+        // Call get_balance_map
+        let result = get_balance_map(&conn, &addresses)?;
+
+        // Verify the results
+        assert_eq!(result.len(), 1, "Should have 1 token");
+
+        let token =
+            Felt::from_hex("0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20")?;
+        let token_balances = result.get(&token).expect("Token should exist");
+
+        // Should have 2 accounts with the NEWER balances (2000 and 5000)
+        assert_eq!(
+            token_balances.len(),
+            2,
+            "Should have 2 accounts with latest balances"
+        );
+
+        // Check that we got the newer values (2000 and 5000), not the older ones (1000 and 3000)
+        let account1 =
+            Felt::from_hex("0x0234567890abcdcd1234567890abcdef1234567890abcdef1234567890abcded")?;
+        let account2 =
+            Felt::from_hex("0x03cdef123456772babcdef1234567890abcdef1234567890abcdef123456787b")?;
+
+        let balance1 = token_balances
+            .get(&account1)
+            .expect("Account 1 should exist");
+        let balance2 = token_balances
+            .get(&account2)
+            .expect("Account 2 should exist");
+
+        // These should be the NEWER balances from block 200 and 250
+        assert_eq!(
+            balance1.to_string(),
+            "2000",
+            "Account 1 should have NEWER balance 2000"
+        );
+        assert_eq!(
+            balance2.to_string(),
+            "5000",
+            "Account 2 should have NEWER balance 5000"
+        );
+
+        println!("Sharding max block number test passed successfully!");
         Ok(())
     }
 }
