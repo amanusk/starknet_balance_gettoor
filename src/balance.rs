@@ -112,8 +112,18 @@ pub fn get_balance_map(
                 .map_err(|e| eyre::eyre!("Failed to execute query: {}", e))?;
 
             // Collect all rows for this token
+            let row_collection_start = std::time::SystemTime::now();
             let all_rows: Result<Vec<_>, _> = rows.collect();
             let all_rows = all_rows.map_err(|e| eyre::eyre!("Failed to collect rows: {}", e))?;
+            let row_collection_end = std::time::SystemTime::now();
+            let row_collection_time = row_collection_end
+                .duration_since(row_collection_start)
+                .unwrap();
+            println!(
+                "Row collection time for token {}: {:?} ms",
+                token,
+                row_collection_time.as_millis()
+            );
 
             // Process rows for this token
             let mut token_balances: HashMap<Felt, Felt> = HashMap::new();
