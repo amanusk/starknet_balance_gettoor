@@ -19,6 +19,7 @@ fn create_connection(db_path: &str) -> Result<Connection> {
 }
 
 // Helper function to convert binary data to hex string
+#[inline]
 fn binary_to_hex(binary_data: &[u8]) -> String {
     hex::encode(binary_data)
 }
@@ -148,12 +149,8 @@ pub fn get_balance_map(
                 ) in shard_rows?
                 {
                     // Convert binary storage address to hex string in Rust
-                    let storage_addr_hex = binary_to_hex(&storage_addr_binary);
-                    let storage_str = format!("0x{storage_addr_hex}");
-                    let storage_addr_felt = match Felt::from_hex(&storage_str) {
-                        Ok(f) => f,
-                        Err(_) => continue,
-                    };
+                    let storage_addr_felt =
+                        Felt::from_bytes_be(&storage_addr_binary.try_into().unwrap());
 
                     let account = match accounts_hash_map.get(&storage_addr_felt) {
                         Some(a) => a,
