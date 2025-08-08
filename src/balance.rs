@@ -49,106 +49,78 @@ pub fn get_balance_map(
     // Step 2: Process each token in parallel
     let parallel_processing_start = std::time::SystemTime::now();
 
-    let num_tokens = addresses.tokens.len();
-    let num_cores = rayon::current_num_threads();
-    println!("Processing {num_tokens} tokens using {num_cores} CPU cores");
-    // Determine how many shards (DB partitions) to use per token to saturate all cores
-    let shards_per_token = std::cmp::max(1, num_cores / std::cmp::max(1, num_tokens));
-    println!(
-        "Using {} shards per token ({} total concurrent DB connections)",
-        shards_per_token,
-        shards_per_token * std::cmp::max(1, num_tokens)
-    );
-
     let token_results: Vec<Result<(Felt, HashMap<Felt, Felt>)>> = addresses
         .tokens
         .par_iter()
         .map(|token| {
+            // Create a new connection for this token
+            let token_conn = create_connection(&db_path)?;
+
             // Create placeholders for this token
             let token_hex = format!("{token:#064x}")[2..].to_string();
             let token_bytes = hex::decode(&token_hex).unwrap_or_default();
 
-            // Run shards in parallel for this token
-            type ShardRow = (String, String, String, i64);
-            let shard_results: Vec<Result<Vec<ShardRow>>> = (0..shards_per_token)
-                .into_par_iter()
-                .map(|shard_idx| {
-                    // Each shard uses its own DB connection
-                    let shard_conn = create_connection(&db_path)?;
+            let batch_query = r#"
+                SELECT
+                    hex(contract_addresses.contract_address),
+                    hex(storage_addresses.storage_address),
+                    hex(storage_value),
+                    MAX(block_number)
+                FROM
+                    storage_updates
+                    JOIN storage_addresses
+                        ON storage_addresses.id = storage_updates.storage_address_id
+                    JOIN contract_addresses
+                        ON contract_addresses.id = storage_updates.contract_address_id
+                WHERE
+                    contract_address = ?
+                GROUP BY
+                    contract_address_id,
+                    storage_address_id
+            "#;
 
-                    // Partition on storage_addresses.id modulo shards_per_token
-                    let batch_query = r#"
-                            SELECT
-                                hex(contract_addresses.contract_address),
-                                hex(storage_addresses.storage_address),
-                                hex(storage_value),
-                                MAX(block_number)
-                            FROM
-                                storage_updates
-                                JOIN storage_addresses
-                                    ON storage_addresses.id = storage_updates.storage_address_id
-                                JOIN contract_addresses
-                                    ON contract_addresses.id = storage_updates.contract_address_id
-                            WHERE
-                                contract_address = ?1
-                                AND (storage_addresses.id % ?2) = ?3
-                            GROUP BY
-                                contract_address_id,
-                                storage_address_id
-                        "#;
+            let mut stmt = token_conn
+                .prepare(batch_query)
+                .map_err(|e| eyre::eyre!("Failed to prepare SQL statement: {}", e))?;
 
-                    let mut stmt = shard_conn
-                        .prepare(batch_query)
-                        .map_err(|e| eyre::eyre!("Failed to prepare SQL statement: {}", e))?;
+            // Execute the query for this token
+            let rows = stmt
+                .query_map([&token_bytes as &dyn rusqlite::ToSql], |row| {
+                    let contract_address_hex: String = row.get(0)?;
+                    let storage_address_hex: String = row.get(1)?;
+                    let storage_value_hex: String = row.get(2)?;
+                    let max_block_number: i64 = row.get(3)?;
 
-                    let rows = stmt
-                        .query_map(
-                            rusqlite::params![
-                                &token_bytes,
-                                shards_per_token as i64,
-                                shard_idx as i64
-                            ],
-                            |row| {
-                                let contract_address_hex: String = row.get(0)?;
-                                let storage_address_hex: String = row.get(1)?;
-                                let storage_value_hex: String = row.get(2)?;
-                                let max_block_number: i64 = row.get(3)?;
-                                Ok((
-                                    contract_address_hex,
-                                    storage_address_hex,
-                                    storage_value_hex,
-                                    max_block_number,
-                                ))
-                            },
-                        )
-                        .map_err(|e| eyre::eyre!("Failed to execute query: {}", e))?;
-
-                    // Collect all rows for this shard
-                    let all_rows: Result<Vec<_>, _> = rows.collect();
-                    let all_rows =
-                        all_rows.map_err(|e| eyre::eyre!("Failed to collect rows: {}", e))?;
-                    Ok(all_rows)
+                    Ok((
+                        contract_address_hex,
+                        storage_address_hex,
+                        storage_value_hex,
+                        max_block_number,
+                    ))
                 })
-                .collect();
+                .map_err(|e| eyre::eyre!("Failed to execute query: {}", e))?;
 
-            // Process rows for this token aggregated from all shards
+            // Collect all rows for this token
+            let all_rows: Result<Vec<_>, _> = rows.collect();
+            let all_rows = all_rows.map_err(|e| eyre::eyre!("Failed to collect rows: {}", e))?;
+
+            // Process rows for this token
             let mut token_balances: HashMap<Felt, Felt> = HashMap::new();
-            for shard_rows in shard_results {
-                for (_contract_address_hex, storage_addr, storage_val, _max_block) in shard_rows? {
-                    let storage_str = format!("0x{storage_addr}");
-                    let storage_addr_felt = match Felt::from_hex(&storage_str) {
-                        Ok(f) => f,
-                        Err(_) => continue,
-                    };
 
-                    let account = match accounts_hash_map.get(&storage_addr_felt) {
-                        Some(a) => a,
-                        None => continue,
-                    };
+            for (_contract_address_hex, storage_addr, storage_val, _) in all_rows {
+                let storage_str = format!("0x{storage_addr}");
+                let storage_addr_felt = match Felt::from_hex(&storage_str) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
 
-                    let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
-                    token_balances.insert(*account, balance_felt);
-                }
+                let account = match accounts_hash_map.get(&storage_addr_felt) {
+                    Some(a) => a,
+                    None => continue,
+                };
+
+                let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
+                token_balances.insert(*account, balance_felt);
             }
 
             Ok((*token, token_balances))
