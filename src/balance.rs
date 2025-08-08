@@ -51,10 +51,7 @@ pub fn get_balance_map(
 
     let num_tokens = addresses.tokens.len();
     let num_cores = rayon::current_num_threads();
-    println!(
-        "Processing {} tokens using {} CPU cores",
-        num_tokens, num_cores
-    );
+    println!("Processing {num_tokens} tokens using {num_cores} CPU cores");
     // Determine how many shards (DB partitions) to use per token to saturate all cores
     let shards_per_token = std::cmp::max(1, num_cores / std::cmp::max(1, num_tokens));
     println!(
@@ -72,8 +69,8 @@ pub fn get_balance_map(
             let token_bytes = hex::decode(&token_hex).unwrap_or_default();
 
             // Run shards in parallel for this token
-            let shard_results: Vec<Result<Vec<(String, String, String, i64)>>> = (0
-                ..shards_per_token)
+            type ShardRow = (String, String, String, i64);
+            let shard_results: Vec<Result<Vec<ShardRow>>> = (0..shards_per_token)
                 .into_par_iter()
                 .map(|shard_idx| {
                     // Each shard uses its own DB connection
