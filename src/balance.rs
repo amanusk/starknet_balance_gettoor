@@ -78,9 +78,8 @@ pub fn get_balance_map(
                     // Partition on storage_addresses.id modulo shards_per_token
                     let batch_query = r#"
                             SELECT
-                                hex(contract_addresses.contract_address),
-                                hex(storage_addresses.storage_address),
-                                hex(storage_value),
+                                storage_addresses.storage_address,
+                                storage_value,
                                 MAX(block_number)
                             FROM
                                 storage_updates
@@ -108,16 +107,10 @@ pub fn get_balance_map(
                                 shard_idx as i64
                             ],
                             |row| {
-                                let contract_address_hex: String = row.get(0)?;
-                                let storage_address_hex: String = row.get(1)?;
-                                let storage_value_hex: String = row.get(2)?;
-                                let max_block_number: i64 = row.get(3)?;
-                                Ok((
-                                    contract_address_hex,
-                                    storage_address_hex,
-                                    storage_value_hex,
-                                    max_block_number,
-                                ))
+                                let storage_address_blob: Vec<u8> = row.get(0)?;
+                                let storage_value_blob: Vec<u8> = row.get(1)?;
+                                let max_block_number: i64 = row.get(2)?;
+                                Ok((storage_address_blob, storage_value_blob, max_block_number))
                             },
                         )
                         .map_err(|e| eyre::eyre!("Failed to execute query: {}", e))?;
@@ -126,19 +119,15 @@ pub fn get_balance_map(
                     let mut shard_balances: HashMap<Felt, Felt> =
                         HashMap::with_capacity(accounts_hash_map.len());
                     for row in rows {
-                        let (_contract_address_hex, storage_addr, storage_val, _max_block) = row?;
-                        let storage_str = format!("0x{storage_addr}");
-                        let storage_addr_felt = match Felt::from_hex(&storage_str) {
-                            Ok(f) => f,
-                            Err(_) => continue,
-                        };
+                        let (storage_addr_blob, storage_val_blob, _max_block) = row?;
+                        let storage_addr_felt = Felt::from_bytes_be_slice(&storage_addr_blob);
 
                         let account = match accounts_hash_map.get(&storage_addr_felt) {
                             Some(a) => a,
                             None => continue,
                         };
 
-                        let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
+                        let balance_felt = Felt::from_bytes_be_slice(&storage_val_blob);
                         shard_balances.insert(*account, balance_felt);
                     }
                     Ok(shard_balances)
