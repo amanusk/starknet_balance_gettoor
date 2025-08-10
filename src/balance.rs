@@ -14,14 +14,8 @@ pub struct Addresses {
 
 // Helper function to create a new database connection
 fn create_connection(db_path: &str) -> Result<Connection> {
-    Connection::open(db_path)
-        .map_err(|e| eyre::eyre!("Failed to create database connection: {}", e))
-}
-
-// Helper function to convert binary data to hex string
-#[inline]
-fn binary_to_hex(binary_data: &[u8]) -> String {
-    hex::encode(binary_data)
+    let conn = Connection::open(db_path)?;
+    Ok(conn)
 }
 
 pub fn get_balance_map(
@@ -40,12 +34,14 @@ pub fn get_balance_map(
 
     // Step 1: Create accounts hash map (single-threaded, fast)
     let hashing_start = std::time::SystemTime::now();
-    let accounts_hash_map: HashMap<Felt, Felt> = addresses
+    let accounts_hash_map: HashMap<Vec<u8>, Felt> = addresses
         .accounts
         .par_iter()
         .map(|item| {
             let val = pedersen_hash(&balances_selector, item);
-            (val, *item)
+            // Convert the hash to binary bytes for faster comparison
+            let hash_bytes = val.to_bytes_be().to_vec();
+            (hash_bytes, *item)
         })
         .collect();
     let hashing_end = std::time::SystemTime::now();
@@ -148,18 +144,21 @@ pub fn get_balance_map(
                     _max_block,
                 ) in shard_rows?
                 {
-                    // Convert binary storage address to hex string in Rust
-                    let storage_addr_felt =
-                        Felt::from_bytes_be(&storage_addr_binary.try_into().unwrap());
-
-                    let account = match accounts_hash_map.get(&storage_addr_felt) {
+                    // Direct binary comparison - no need to convert to Felt
+                    let account = match accounts_hash_map.get(&storage_addr_binary) {
                         Some(a) => a,
                         None => continue,
                     };
 
-                    // Convert binary storage value to hex string in Rust
-                    let storage_val_hex = binary_to_hex(&storage_val_binary);
-                    let balance_felt = Felt::from_hex(&storage_val_hex).unwrap_or(Felt::ZERO);
+                    // Convert binary storage value directly to Felt (more efficient than hex conversion)
+                    let balance_felt = if storage_val_binary.len() == 32 {
+                        Felt::from_bytes_be(&storage_val_binary.try_into().unwrap())
+                    } else if storage_val_binary.len() < 32 {
+                        // Pad with zeros to the left (big-endian)
+                        let mut padded = vec![0u8; 32 - storage_val_binary.len()];
+                        padded.extend_from_slice(&storage_val_binary);
+                        Felt::from_bytes_be(&padded.try_into().unwrap())
+                    }
                     token_balances.insert(*account, balance_felt);
                 }
             }
