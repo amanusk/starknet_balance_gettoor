@@ -1,3 +1,4 @@
+use crossbeam_channel::bounded;
 use csv::Writer;
 use eyre::Result;
 use rayon::prelude::*;
@@ -5,9 +6,8 @@ use rusqlite::Connection;
 use starknet::core::types::Felt;
 use std::collections::HashMap;
 use std::fs::File;
-use std::time::SystemTime;
-use crossbeam_channel::bounded;
 use std::thread;
+use std::time::SystemTime;
 
 /// Configuration for output formats
 #[derive(Debug, Clone)]
@@ -63,7 +63,10 @@ pub fn write_results(
         store_map_as_csv(token_map)
             .map_err(|e| eyre::eyre!("Failed to store map as CSV: {}", e))?;
         let csv_time = csv_start.elapsed().unwrap();
-        println!("Results written to token_map.csv in {:?} ms", csv_time.as_millis());
+        println!(
+            "Results written to token_map.csv in {:?} ms",
+            csv_time.as_millis()
+        );
     }
 
     if config.json {
@@ -93,7 +96,7 @@ pub fn write_results(
 /// Store the token map as a CSV file with parallel generation streamed to a single writer
 fn store_map_as_csv(
     token_map: &HashMap<Felt, HashMap<Felt, Felt>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let file = File::create("token_map.csv")?;
     let mut wtr = Writer::from_writer(file);
 
@@ -104,19 +107,21 @@ fn store_map_as_csv(
     let (tx, rx) = bounded::<Vec<[String; 3]>>(64);
 
     // Writer thread consumes records and writes to CSV
-    let writer_handle = thread::spawn(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let write_start = SystemTime::now();
-        for batch in rx {
-            for record in batch {
-                // CSV writer isn't thread-safe; only this thread writes
-                wtr.write_record(&record)?;
+    let writer_handle = thread::spawn(
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let write_start = SystemTime::now();
+            for batch in rx {
+                for record in batch {
+                    // CSV writer isn't thread-safe; only this thread writes
+                    wtr.write_record(&record)?;
+                }
             }
-        }
-        wtr.flush()?;
-        let write_time = write_start.elapsed().unwrap();
-        println!("CSV streamed write time: {:?} ms", write_time.as_millis());
-        Ok(())
-    });
+            wtr.flush()?;
+            let write_time = write_start.elapsed().unwrap();
+            println!("CSV streamed write time: {:?} ms", write_time.as_millis());
+            Ok(())
+        },
+    );
 
     // Producers generate batches per token in parallel
     token_map.par_iter().for_each(|(token, sub_map)| {
@@ -139,7 +144,11 @@ fn store_map_as_csv(
     // Propagate writer errors
     match writer_handle.join() {
         Ok(result) => result?,
-        Err(_) => return Err(Box::<dyn std::error::Error>::from("CSV writer thread panicked")),
+        Err(_) => {
+            return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                "CSV writer thread panicked",
+            ))
+        }
     }
 
     Ok(())
@@ -206,7 +215,10 @@ fn store_map_in_sqlite(token_map: &HashMap<Felt, HashMap<Felt, Felt>>) -> eyre::
             .map_err(|e| eyre::eyre!("Failed to commit transaction: {}", e))?;
 
         let tx_time = tx_start.elapsed().unwrap();
-        println!("SQLite streamed transaction time: {:?} ms", tx_time.as_millis());
+        println!(
+            "SQLite streamed transaction time: {:?} ms",
+            tx_time.as_millis()
+        );
 
         Ok(())
     });
