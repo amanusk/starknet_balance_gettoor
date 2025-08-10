@@ -5,6 +5,9 @@ use rusqlite::Connection;
 use starknet::core::types::Felt;
 use std::collections::HashMap;
 use std::fs::File;
+use std::time::SystemTime;
+use crossbeam_channel::bounded;
+use std::thread;
 
 /// Configuration for output formats
 #[derive(Debug, Clone)]
@@ -56,23 +59,18 @@ pub fn write_results(
     );
 
     if config.csv {
-        let csv_start = std::time::SystemTime::now();
+        let csv_start = SystemTime::now();
         store_map_as_csv(token_map)
             .map_err(|e| eyre::eyre!("Failed to store map as CSV: {}", e))?;
-        let csv_end = std::time::SystemTime::now();
-        let csv_time = csv_end.duration_since(csv_start).unwrap();
-        println!(
-            "Results written to token_map.csv in {:?} ms",
-            csv_time.as_millis()
-        );
+        let csv_time = csv_start.elapsed().unwrap();
+        println!("Results written to token_map.csv in {:?} ms", csv_time.as_millis());
     }
 
     if config.json {
-        let json_start = std::time::SystemTime::now();
+        let json_start = SystemTime::now();
         store_map_as_json(token_map)
             .map_err(|e| eyre::eyre!("Failed to store map as JSON: {}", e))?;
-        let json_end = std::time::SystemTime::now();
-        let json_time = json_end.duration_since(json_start).unwrap();
+        let json_time = json_start.elapsed().unwrap();
         println!(
             "Results written to token_map.json in {:?} ms",
             json_time.as_millis()
@@ -80,10 +78,9 @@ pub fn write_results(
     }
 
     if config.sqlite {
-        let sqlite_start = std::time::SystemTime::now();
+        let sqlite_start = SystemTime::now();
         store_map_in_sqlite(token_map)?;
-        let sqlite_end = std::time::SystemTime::now();
-        let sqlite_time = sqlite_end.duration_since(sqlite_start).unwrap();
+        let sqlite_time = sqlite_start.elapsed().unwrap();
         println!(
             "Results written to token_map.db in {:?} ms",
             sqlite_time.as_millis()
@@ -93,7 +90,7 @@ pub fn write_results(
     Ok(())
 }
 
-/// Store the token map as a CSV file with parallel record generation
+/// Store the token map as a CSV file with parallel generation streamed to a single writer
 fn store_map_as_csv(
     token_map: &HashMap<Felt, HashMap<Felt, Felt>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -103,42 +100,48 @@ fn store_map_as_csv(
     // Write header row
     wtr.write_record(["Token", "Account", "Balance"])?;
 
-    // Generate all records in parallel, then write sequentially
-    let parallel_start = std::time::SystemTime::now();
+    // Bounded channel to backpressure producers if writing is slower
+    let (tx, rx) = bounded::<Vec<[String; 3]>>(64);
 
-    let records: Vec<[String; 3]> = token_map
-        .par_iter()
-        .flat_map(|(token, sub_map)| {
-            sub_map
-                .par_iter()
-                .map(|(account, balance)| {
-                    [
-                        format!("{token:#064x}"),
-                        format!("{account:#064x}"),
-                        balance.to_string(),
-                    ]
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    // Writer thread consumes records and writes to CSV
+    let writer_handle = thread::spawn(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let write_start = SystemTime::now();
+        for batch in rx {
+            for record in batch {
+                // CSV writer isn't thread-safe; only this thread writes
+                wtr.write_record(&record)?;
+            }
+        }
+        wtr.flush()?;
+        let write_time = write_start.elapsed().unwrap();
+        println!("CSV streamed write time: {:?} ms", write_time.as_millis());
+        Ok(())
+    });
 
-    let parallel_end = std::time::SystemTime::now();
-    let parallel_time = parallel_end.duration_since(parallel_start).unwrap();
-    println!(
-        "CSV parallel record generation time: {:?} ms",
-        parallel_time.as_millis()
-    );
+    // Producers generate batches per token in parallel
+    token_map.par_iter().for_each(|(token, sub_map)| {
+        let batch: Vec<[String; 3]> = sub_map
+            .par_iter()
+            .map(|(account, balance)| {
+                [
+                    format!("{token:#064x}"),
+                    format!("{account:#064x}"),
+                    balance.to_string(),
+                ]
+            })
+            .collect();
+        let _ = tx.send(batch);
+    });
 
-    // Write all records sequentially (CSV writer isn't thread-safe)
-    let write_start = std::time::SystemTime::now();
-    for record in records {
-        wtr.write_record(&record)?;
+    // Close channel to signal writer completion
+    drop(tx);
+
+    // Propagate writer errors
+    match writer_handle.join() {
+        Ok(result) => result?,
+        Err(_) => return Err(Box::<dyn std::error::Error>::from("CSV writer thread panicked")),
     }
-    let write_end = std::time::SystemTime::now();
-    let write_time = write_end.duration_since(write_start).unwrap();
-    println!("CSV sequential write time: {:?} ms", write_time.as_millis());
 
-    wtr.flush()?;
     Ok(())
 }
 
@@ -151,10 +154,16 @@ fn store_map_as_json(
     Ok(())
 }
 
-/// Store the token map in SQLite database with optimized batch insertions
+/// Store the token map in SQLite database with streaming batch insertions
 fn store_map_in_sqlite(token_map: &HashMap<Felt, HashMap<Felt, Felt>>) -> eyre::Result<()> {
     let conn = Connection::open("token_map.db")
         .map_err(|e| eyre::eyre!("Failed to open SQLite database: {}", e))?;
+
+    // PRAGMAs to speed up bulk insert (acceptable for generated artifacts)
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;\nPRAGMA synchronous = NORMAL;\nPRAGMA temp_store = MEMORY;",
+    )
+    .map_err(|e| eyre::eyre!("Failed to apply PRAGMAs: {}", e))?;
 
     // Create the table if it doesn't exist
     conn.execute(
@@ -167,60 +176,64 @@ fn store_map_in_sqlite(token_map: &HashMap<Felt, HashMap<Felt, Felt>>) -> eyre::
     )
     .map_err(|e| eyre::eyre!("Failed to create table: {}", e))?;
 
-    // Generate all records in parallel first
-    let parallel_start = std::time::SystemTime::now();
+    // Channel for streaming batches into the writer loop
+    let (tx, rx) = bounded::<Vec<(String, String, String)>>(64);
 
-    let records: Vec<(String, String, String)> = token_map
-        .par_iter()
-        .flat_map(|(token, sub_map)| {
-            sub_map
-                .par_iter()
-                .map(|(account, balance)| {
-                    (
-                        format!("{token:#064x}"),
-                        format!("{account:#064x}"),
-                        balance.to_string(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    // Move connection into writer thread
+    let writer_handle = thread::spawn(move || -> eyre::Result<()> {
+        let tx_start = SystemTime::now();
+        let tx_sql = conn
+            .unchecked_transaction()
+            .map_err(|e| eyre::eyre!("Failed to begin transaction: {}", e))?;
 
-    let parallel_end = std::time::SystemTime::now();
-    let parallel_time = parallel_end.duration_since(parallel_start).unwrap();
-    println!(
-        "SQLite parallel record generation time: {:?} ms",
-        parallel_time.as_millis()
-    );
+        let mut stmt = tx_sql
+            .prepare(
+                "INSERT INTO token_map (token, account, balance)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .map_err(|e| eyre::eyre!("Failed to prepare insert statement: {}", e))?;
 
-    // Use transaction for better performance
-    let tx_start = std::time::SystemTime::now();
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| eyre::eyre!("Failed to begin transaction: {}", e))?;
+        for batch in rx {
+            for (token, account, balance) in batch {
+                stmt.execute(rusqlite::params![token, account, balance])
+                    .map_err(|e| eyre::eyre!("Failed to insert row: {}", e))?;
+            }
+        }
 
-    // Prepare the insertion statement once
-    let mut stmt = tx
-        .prepare(
-            "INSERT INTO token_map (token, account, balance)
-             VALUES (?1, ?2, ?3)",
-        )
-        .map_err(|e| eyre::eyre!("Failed to prepare insert statement: {}", e))?;
+        drop(stmt);
+        tx_sql
+            .commit()
+            .map_err(|e| eyre::eyre!("Failed to commit transaction: {}", e))?;
 
-    // Insert all records in the transaction
-    for (token, account, balance) in records {
-        stmt.execute(rusqlite::params![token, account, balance])
-            .map_err(|e| eyre::eyre!("Failed to insert row: {}", e))?;
+        let tx_time = tx_start.elapsed().unwrap();
+        println!("SQLite streamed transaction time: {:?} ms", tx_time.as_millis());
+
+        Ok(())
+    });
+
+    // Producers generate batches per token in parallel
+    token_map.par_iter().for_each(|(token, sub_map)| {
+        let batch: Vec<(String, String, String)> = sub_map
+            .par_iter()
+            .map(|(account, balance)| {
+                (
+                    format!("{token:#064x}"),
+                    format!("{account:#064x}"),
+                    balance.to_string(),
+                )
+            })
+            .collect();
+        let _ = tx.send(batch);
+    });
+
+    // Close channel to signal writer completion
+    drop(tx);
+
+    // Propagate writer errors
+    match writer_handle.join() {
+        Ok(result) => result?,
+        Err(_) => return Err(eyre::eyre!("SQLite writer thread panicked")),
     }
-
-    // Commit the transaction
-    drop(stmt);
-    tx.commit()
-        .map_err(|e| eyre::eyre!("Failed to commit transaction: {}", e))?;
-
-    let tx_end = std::time::SystemTime::now();
-    let tx_time = tx_end.duration_since(tx_start).unwrap();
-    println!("SQLite transaction time: {:?} ms", tx_time.as_millis());
 
     Ok(())
 }
