@@ -151,14 +151,10 @@ pub fn get_balance_map(
                     };
 
                     // Convert binary storage value directly to Felt (more efficient than hex conversion)
-                    let balance_felt = if storage_val_binary.len() == 32 {
-                        Felt::from_bytes_be(&storage_val_binary.try_into().unwrap())
-                    } else if storage_val_binary.len() < 32 {
-                        // Pad with zeros to the left (big-endian)
-                        let mut padded = vec![0u8; 32 - storage_val_binary.len()];
-                        padded.extend_from_slice(&storage_val_binary);
-                        Felt::from_bytes_be(&padded.try_into().unwrap())
-                    }
+                    // Pad with zeros to the left (big-endian)
+                    let mut padded = vec![0u8; 32 - storage_val_binary.len()];
+                    padded.extend_from_slice(&storage_val_binary);
+                    let balance_felt = Felt::from_bytes_be(&padded.try_into().unwrap());
                     token_balances.insert(*account, balance_felt);
                 }
             }
