@@ -69,8 +69,7 @@ pub fn get_balance_map(
             let token_bytes = hex::decode(&token_hex).unwrap_or_default();
 
             // Run shards in parallel for this token
-            type ShardRow = (String, String, String, i64);
-            let shard_results: Vec<Result<Vec<ShardRow>>> = (0..shards_per_token)
+            let shard_results: Vec<Result<HashMap<Felt, Felt>>> = (0..shards_per_token)
                 .into_par_iter()
                 .map(|shard_idx| {
                     // Each shard uses its own DB connection
@@ -123,31 +122,36 @@ pub fn get_balance_map(
                         )
                         .map_err(|e| eyre::eyre!("Failed to execute query: {}", e))?;
 
-                    // Collect all rows for this shard
-                    let all_rows: Result<Vec<_>, _> = rows.collect();
-                    let all_rows =
-                        all_rows.map_err(|e| eyre::eyre!("Failed to collect rows: {}", e))?;
-                    Ok(all_rows)
+                    // Process rows directly into a HashMap for this shard
+                    let mut shard_balances: HashMap<Felt, Felt> =
+                        HashMap::with_capacity(accounts_hash_map.len());
+                    for row in rows {
+                        let (_contract_address_hex, storage_addr, storage_val, _max_block) = row?;
+                        let storage_str = format!("0x{storage_addr}");
+                        let storage_addr_felt = match Felt::from_hex(&storage_str) {
+                            Ok(f) => f,
+                            Err(_) => continue,
+                        };
+
+                        let account = match accounts_hash_map.get(&storage_addr_felt) {
+                            Some(a) => a,
+                            None => continue,
+                        };
+
+                        let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
+                        shard_balances.insert(*account, balance_felt);
+                    }
+                    Ok(shard_balances)
                 })
                 .collect();
 
-            // Process rows for this token aggregated from all shards
-            let mut token_balances: HashMap<Felt, Felt> = HashMap::new();
-            for shard_rows in shard_results {
-                for (_contract_address_hex, storage_addr, storage_val, _max_block) in shard_rows? {
-                    let storage_str = format!("0x{storage_addr}");
-                    let storage_addr_felt = match Felt::from_hex(&storage_str) {
-                        Ok(f) => f,
-                        Err(_) => continue,
-                    };
-
-                    let account = match accounts_hash_map.get(&storage_addr_felt) {
-                        Some(a) => a,
-                        None => continue,
-                    };
-
-                    let balance_felt = Felt::from_hex(&storage_val).unwrap_or(Felt::ZERO);
-                    token_balances.insert(*account, balance_felt);
+            // Merge results from all shards for this token
+            let mut token_balances: HashMap<Felt, Felt> =
+                HashMap::with_capacity(accounts_hash_map.len());
+            for shard_balances in shard_results {
+                let shard_balances = shard_balances?;
+                for (account, balance) in shard_balances {
+                    token_balances.insert(account, balance);
                 }
             }
 
